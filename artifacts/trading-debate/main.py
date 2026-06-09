@@ -144,12 +144,28 @@ def _gemini_analyze(image_bytes: bytes, mime: str, extra: str) -> dict:
     return result
 
 
-# Active Groq vision models to try in order (2026)
-# Llama 4 Scout and Maverick are multimodal; listed newest-first as fallbacks.
-GROQ_VISION_MODELS = [
-    ("meta-llama/llama-4-scout-17b-16e-instruct",    "Llama 4 Scout 17B (Groq)"),
-    ("meta-llama/llama-4-maverick-17b-128e-instruct", "Llama 4 Maverick 17B (Groq)"),
-]
+# ── Dynamic Groq vision model discovery ──────────────────────────────────────
+# No hardcoded model names. At runtime we ask Groq for its live model list and
+# pick the first model whose ID contains "vision". When Groq renames or adds
+# models the code automatically picks up the new name — no code changes needed.
+
+def _discover_groq_vision_models() -> list[tuple[str, str]]:
+    """
+    Query Groq's live /models endpoint and return all vision-capable model IDs.
+    Falls back to an empty list if the API call fails.
+    """
+    try:
+        from groq import Groq
+        client  = Groq(api_key=require_secret("GROQ_API_KEY"))
+        listing = client.models.list()
+        found   = [
+            (m.id, m.id)
+            for m in listing.data
+            if "vision" in m.id.lower()
+        ]
+        return found
+    except Exception:
+        return []
 
 
 def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str,
@@ -190,49 +206,101 @@ def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str,
     return result
 
 
+# ── Safe text fallback used when ALL vision APIs are unavailable ──────────────
+_TEXT_FALLBACK_DATA: dict = {
+    "asset":            "Unknown (vision APIs unavailable)",
+    "timeframe":        "Unknown",
+    "timeframe_minutes": 5,
+    "current_price":    "Unknown",
+    "trend":            "Unknown — treat as highly volatile",
+    "support":          [],
+    "resistance":       [],
+    "indicators":       {},
+    "patterns":         [],
+    "technical_summary": (
+        "Chart image could not be analysed — all vision APIs are currently "
+        "unavailable. The AI committee will debate using strict risk-management "
+        "assumptions: highly volatile market, no confirmed trend."
+    ),
+    "live_news": [],
+    "news_summary": "No live news available. Assume high uncertainty.",
+    "vision_model":       "Text Fallback (no vision API available)",
+    "gemini_vote":        "WAIT",
+    "gemini_confidence":  0,
+    "gemini_reasoning":   "Vision analysis unavailable — all analysts should apply strict risk management.",
+}
+
+
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
-    Returns (chart_data, status_message).
-    Strategy:
-      1. Try Gemini up to 3 times with a 3-second pause between attempts
-         (503 demand spikes usually clear within seconds).
-      2. If all Gemini attempts fail, try each Groq vision model in order
-         until one succeeds.
-      3. If everything fails, raise a RuntimeError with a full error log.
+    Returns (chart_data, status_message).  Never raises — always returns data.
+
+    Strategy
+    ────────
+    1. Try Gemini 2.5 Flash up to 3 times (3-second pause between attempts).
+       503 high-demand spikes usually clear within one retry.
+    2. If all Gemini attempts fail, call Groq's live /models API to discover
+       every currently active vision model dynamically, then try each one in
+       turn until one succeeds.  No hardcoded model names — future-proof.
+    3. If every vision option fails, return a safe text-only fallback so the
+       debate (Steps 2-3) can still run with full risk-management context.
     """
     GEMINI_RETRIES = 3
     GEMINI_DELAY   = 3  # seconds between retries
 
-    gemini_errors = []
+    # ── 1. Gemini with retries ────────────────────────────────────────────────
+    gemini_errors: list[str] = []
     for attempt in range(1, GEMINI_RETRIES + 1):
         try:
-            data = _gemini_analyze(image_bytes, mime, extra)
+            data   = _gemini_analyze(image_bytes, mime, extra)
             suffix = f" (attempt {attempt}/{GEMINI_RETRIES})" if attempt > 1 else ""
             return data, f"✨ Gemini 2.5 Flash — chart analysis complete{suffix}."
         except Exception as exc:
-            gemini_errors.append(f"Attempt {attempt}: {type(exc).__name__}: {str(exc)[:120]}")
+            gemini_errors.append(
+                f"Attempt {attempt}: {type(exc).__name__}: {str(exc)[:140]}"
+            )
             if attempt < GEMINI_RETRIES:
                 time.sleep(GEMINI_DELAY)
 
-    # All Gemini retries exhausted — try Groq vision models in sequence
-    groq_errors = []
-    for model_id, model_label in GROQ_VISION_MODELS:
-        try:
-            data = _groq_vision_analyze(image_bytes, mime, extra, model_id, model_label)
-            gemini_summary = " | ".join(gemini_errors)
-            return data, (
-                f"⚠️ Gemini failed after {GEMINI_RETRIES} attempts "
-                f"({gemini_summary[:160]}). "
-                f"Fell back to **{model_label}** — analysis complete."
-            )
-        except Exception as exc:
-            groq_errors.append(f"{model_label}: {type(exc).__name__}: {str(exc)[:120]}")
+    # ── 2. Dynamic Groq vision fallback ──────────────────────────────────────
+    groq_vision_models = _discover_groq_vision_models()
+    groq_errors: list[str] = []
 
-    raise RuntimeError(
-        f"All vision models failed. Cannot read the chart.\n\n"
-        f"Gemini errors:\n" + "\n".join(gemini_errors) + "\n\n"
-        f"Groq fallback errors:\n" + "\n".join(groq_errors)
+    if groq_vision_models:
+        for model_id, model_label in groq_vision_models:
+            try:
+                data = _groq_vision_analyze(
+                    image_bytes, mime, extra, model_id, model_label
+                )
+                gemini_summary = " | ".join(gemini_errors)
+                return data, (
+                    f"⚠️ Gemini failed after {GEMINI_RETRIES} attempts "
+                    f"({gemini_summary[:180]}). "
+                    f"Auto-detected and used **{model_label}** (Groq) — "
+                    "analysis complete."
+                )
+            except Exception as exc:
+                groq_errors.append(
+                    f"{model_label}: {type(exc).__name__}: {str(exc)[:140]}"
+                )
+    else:
+        groq_errors.append("No vision-capable models found in Groq model list.")
+
+    # ── 3. Text fallback — never stop execution ───────────────────────────────
+    all_errors = (
+        "Gemini: " + " | ".join(gemini_errors)
+        + " || Groq: " + " | ".join(groq_errors)
     )
+    status = (
+        "🚨 **All vision APIs failed** — running in text-fallback mode.\n\n"
+        f"Errors: {all_errors[:300]}\n\n"
+        "The AI committee will debate using a **highly volatile / high-risk** "
+        "context. Chart-specific signals will not be available."
+    )
+    fallback = dict(_TEXT_FALLBACK_DATA)
+    if extra.strip():
+        fallback["technical_summary"] += f" User context: {extra.strip()}"
+    return fallback, status
 
 
 # ─────────────────────────────────────────────────────────────────────────────
