@@ -118,11 +118,31 @@ GEMINI_SYNTH_PROMPT_TPL = """You are the debate moderator and final decision-mak
 
 Below is the complete debate transcript between five AI trading analysts.
 Study all initial positions and all cross-examination responses, then deliver
-a final verdict.
+a final verdict AND a precise candle-based trade recommendation.
+
+Chart timeframe detected by Gemini: {timeframe}
 
 === DEBATE TRANSCRIPT ===
 {transcript}
 =========================
+
+RECOMMENDED ACTION rules (apply strictly):
+- If FINAL_DECISION is UP or DOWN:
+    * Estimate how many consecutive candles (1–5) the move is likely to last,
+      based on momentum, volume, and pattern strength visible in the debate.
+    * Calculate total_duration_minutes = candle_count × candle_duration_minutes.
+    * candle_duration_minutes must match the detected timeframe exactly
+      (e.g. 1 for 1-min, 5 for 5-min, 10 for 10-min, 15 for 15-min, 60 for 1H, etc.).
+    * Set should_trade to true.
+    * Set dont_trade_reason to null.
+    * Build display_text in exactly this format:
+      "TRADE DIRECTION: <UP|DOWN> | TARGET: Next <N> candles will go <UP|DOWN> (Duration: <total> minutes on a <tf>-min chart)"
+- If FINAL_DECISION is WAIT:
+    * Set should_trade to false, trade_direction to null, candle_count to null,
+      candle_duration_minutes to null, total_duration_minutes to null.
+    * Write a specific dont_trade_reason (volatility, low volume, conflicting signals, etc.).
+    * Build display_text in exactly this format:
+      "DON'T TRADE: <specific reason — market conditions, asset name, and timeframe>"
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -133,7 +153,16 @@ Return ONLY valid JSON (no markdown):
   "FINAL_DECISION":    "<UP|DOWN|WAIT>",
   "confidence":        <integer 0-100>,
   "action":            "<one clear, actionable sentence for a trader>",
-  "moderator_note":    "<2-3 sentence moderator summary>"
+  "moderator_note":    "<2-3 sentence moderator summary>",
+  "recommended_action": {{
+    "should_trade":             <true|false>,
+    "trade_direction":          "<UP|DOWN|null>",
+    "candle_count":             <integer or null>,
+    "candle_duration_minutes":  <integer or null>,
+    "total_duration_minutes":   <integer or null>,
+    "dont_trade_reason":        "<string or null>",
+    "display_text":             "<formatted string per rules above>"
+  }}
 }}"""
 
 
@@ -406,7 +435,8 @@ def step4_gemini_synthesize(gemini_data: dict,
             )
 
     transcript = "\n".join(lines)
-    prompt = GEMINI_SYNTH_PROMPT_TPL.format(transcript=transcript)
+    timeframe = gemini_data.get("timeframe", "unknown")
+    prompt = GEMINI_SYNTH_PROMPT_TPL.format(transcript=transcript, timeframe=timeframe)
 
     client = _gemini_client()
     resp = client.models.generate_content(
@@ -511,6 +541,86 @@ def render_debate_response(d: dict):
                 f"{s_icon} **To {r.get('target','?')}** [{stance}]: {r.get('argument','')}"
             )
         st.markdown(f"💬 *Final reasoning: {d.get('final_reasoning','')}*")
+
+
+def render_trade_recommendation(synth: dict):
+    """Render the bold highlighted RECOMMENDED ACTION box at the very bottom."""
+    ra = synth.get("recommended_action", {})
+    if not ra:
+        return
+
+    should_trade = ra.get("should_trade", False)
+    display_text = ra.get("display_text", "")
+    direction    = ra.get("trade_direction", "")
+    candles      = ra.get("candle_count")
+    tf_mins      = ra.get("candle_duration_minutes")
+    total_mins   = ra.get("total_duration_minutes")
+    no_trade_rsn = ra.get("dont_trade_reason", "")
+
+    st.markdown("---")
+    st.markdown("## 🎯 Recommended Action")
+
+    if should_trade and direction in ("UP", "DOWN"):
+        bg_color  = "#0a3d0a" if direction == "UP" else "#3d0a0a"
+        txt_color = "#00ff88" if direction == "UP" else "#ff4444"
+        border    = "#00cc66" if direction == "UP" else "#cc0000"
+        arrow     = "⬆️" if direction == "UP" else "⬇️"
+
+        st.markdown(
+            f"""
+            <div style="
+                background-color:{bg_color};
+                border:3px solid {border};
+                border-radius:12px;
+                padding:28px 32px;
+                margin:12px 0 8px 0;
+                text-align:center;
+            ">
+                <div style="font-size:2rem;margin-bottom:8px;">{arrow}</div>
+                <div style="
+                    color:{txt_color};
+                    font-size:1.55rem;
+                    font-weight:900;
+                    letter-spacing:0.02em;
+                    line-height:1.5;
+                ">{display_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if candles and tf_mins and total_mins:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Trade Direction", f"{arrow} {direction}")
+            c2.metric("Candles to Hold", f"{candles} candle{'s' if candles != 1 else ''}")
+            c3.metric("Estimated Duration", f"{total_mins} min")
+
+    else:
+        st.markdown(
+            f"""
+            <div style="
+                background-color:#2d2200;
+                border:3px solid #cc8800;
+                border-radius:12px;
+                padding:28px 32px;
+                margin:12px 0 8px 0;
+                text-align:center;
+            ">
+                <div style="font-size:2rem;margin-bottom:8px;">🚫</div>
+                <div style="
+                    color:#ffcc00;
+                    font-size:1.55rem;
+                    font-weight:900;
+                    letter-spacing:0.02em;
+                    line-height:1.5;
+                ">{display_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if no_trade_rsn and no_trade_rsn not in ("null", ""):
+            st.warning(f"⚠️ **Reason:** {no_trade_rsn}")
 
 
 def render_final_decision(synth: dict):
@@ -718,4 +828,5 @@ with st.spinner("✨ Gemini is moderating the debate and computing the final ver
         st.stop()
 
 render_final_decision(synthesis)
+render_trade_recommendation(synthesis)
 st.balloons()
