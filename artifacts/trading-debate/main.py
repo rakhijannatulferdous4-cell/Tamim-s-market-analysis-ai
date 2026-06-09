@@ -35,15 +35,20 @@ st.set_page_config(
 # Secrets
 # ─────────────────────────────────────────────────────────────────────────────
 def _secret(key: str) -> str:
+    # 1. Try Streamlit secrets (.streamlit/secrets.toml)
+    val = ""
     try:
-        val = st.secrets[key]
+        val = st.secrets.get(key, "") or ""
     except Exception:
-        val = os.environ.get(key, "")
+        pass
+    # 2. Fall back to Replit Secrets (stored as environment variables)
+    if not val:
+        val = os.environ.get(key, "") or ""
     if not val:
         st.error(
-            f"**{key}** is not set.  \n"
-            "Add it to `.streamlit/secrets.toml`:\n```\n"
-            f'{key} = "your-key-here"\n```'
+            f"**{key}** is not set.  \n\n"
+            "The key was not found in Streamlit secrets or environment variables.  \n"
+            "Add it via the Replit **Secrets** panel (🔒 icon in the left sidebar)."
         )
         st.stop()
     return val
