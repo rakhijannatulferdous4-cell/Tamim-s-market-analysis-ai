@@ -384,6 +384,11 @@ def _call_deepseek(gemini_data: dict) -> dict:
         },
         timeout=40,
     )
+    if resp.status_code == 402:
+        raise RuntimeError(
+            "💳 DeepSeek is waiting for a top-up (402 Payment Required). "
+            "Skipping — the remaining analysts will carry the debate."
+        )
     resp.raise_for_status()
     result = parse_json(resp.json()["choices"][0]["message"]["content"])
     result.setdefault("model", "DeepSeek-Chat")
@@ -471,7 +476,7 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
         from groq import Groq
         client = Groq(api_key=require_secret("GROQ_API_KEY"))
         chat   = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a trading debate moderator. Respond with valid JSON only."},
                 {"role": "user",   "content": p},
@@ -777,10 +782,10 @@ st.markdown("---")
 st.markdown("## Step 2 — Independent Analyst Votes")
 
 ANALYST_MODELS = [
-    ("groq",     "llama3-70b-8192",    "Llama 3 70B"),
-    ("groq",     "mixtral-8x7b-32768", "Mixtral 8x7B"),
-    ("groq",     "gemma2-9b-it",       "Gemma 2 9B"),
-    ("deepseek", None,                 "DeepSeek-Chat"),
+    ("groq",     "llama-3.3-70b-versatile", "Llama 3.3 70B"),
+    ("groq",     "mixtral-8x7b-32768",      "Mixtral 8x7B"),
+    ("groq",     "llama-3.1-8b-instant",    "Llama 3.1 8B"),
+    ("deepseek", None,                       "DeepSeek-Chat"),
 ]
 
 analyst_votes: list[dict] = []
