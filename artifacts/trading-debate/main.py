@@ -1,28 +1,26 @@
 """
-AI Trading Debate — 5 live models, real APIs, full cross-examination round.
+AI Trading Debate — 5 live AI models, 3 real APIs.
 
 Pipeline
 ────────
-Step 1  Gemini 2.5 Flash  →  reads the chart image + fetches live market news
-Step 2  Llama 3 70b / Mixtral 8x7b / Gemma 2 9b (Groq) + DeepSeek-Chat
-        →  each receives Gemini's findings and gives an independent analysis
-Step 3  Cross-Examination  →  every model critiques the others and refines its
-        position
-Step 4  Final Synthesis  →  Gemini moderates and delivers FINAL_DECISION
+Step 1  Gemini 2.5 Flash   — reads chart image + fetches live market news
+Step 2  Llama 3 70B        — independent vote via Groq
+        Mixtral 8x7B       — independent vote via Groq
+        Gemma 2 9B         — independent vote via Groq
+        DeepSeek-Chat      — independent vote via DeepSeek API
+Step 3  Gemini 2.5 Flash   — receives all 5 opinions, runs cross-examination,
+                             delivers FINAL_DECISION + candle recommendation
 """
 
-import base64
 import json
 import os
-import textwrap
-import time
 
 import requests
 import streamlit as st
 from PIL import Image
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page configuration
+# Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Trading Debate",
@@ -32,159 +30,95 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Secrets
+# Secret loader — tries st.secrets first, then Replit env var
 # ─────────────────────────────────────────────────────────────────────────────
-def _secret(key: str) -> str:
-    # 1. Try Streamlit secrets (.streamlit/secrets.toml)
+def get_secret(key: str) -> str:
     val = ""
     try:
         val = st.secrets.get(key, "") or ""
     except Exception:
         pass
-    # 2. Fall back to Replit Secrets (stored as environment variables)
     if not val:
         val = os.environ.get(key, "") or ""
+    return val
+
+
+def require_secret(key: str) -> str:
+    val = get_secret(key)
     if not val:
         st.error(
-            f"**{key}** is not set.  \n\n"
-            "The key was not found in Streamlit secrets or environment variables.  \n"
-            "Add it via the Replit **Secrets** panel (🔒 icon in the left sidebar)."
+            f"**{key}** is missing.\n\n"
+            "Open the Replit **Secrets** panel (🔒 icon) and add it there."
         )
         st.stop()
     return val
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cached clients
+# JSON extractor
 # ─────────────────────────────────────────────────────────────────────────────
-@st.cache_resource
-def _gemini_client():
-    from google import genai
-    return genai.Client(api_key=_secret("GEMINI_API_KEY"))
-
-
-@st.cache_resource
-def _groq_client():
-    from groq import Groq
-    return Groq(api_key=_secret("GROQ_API_KEY"))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# JSON extraction helper
-# ─────────────────────────────────────────────────────────────────────────────
-def _parse_json(text: str) -> dict:
-    """Extract the first JSON object from a model response."""
-    raw = text
+def parse_json(text: str) -> dict:
+    raw = text or ""
     if "```json" in raw:
         raw = raw.split("```json", 1)[1].split("```", 1)[0]
     elif "```" in raw:
         raw = raw.split("```", 1)[1].split("```", 1)[0]
-    start, end = raw.find("{"), raw.rfind("}") + 1
-    if start == -1:
-        raise ValueError(f"No JSON object found in response:\n{text}")
+    start = raw.find("{")
+    end   = raw.rfind("}") + 1
+    if start < 0:
+        raise ValueError(f"No JSON found in model response:\n{text[:500]}")
     return json.loads(raw[start:end])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Gemini: chart vision + live news (search grounding)
+# STEP 1 — Gemini: chart vision + live news
 # ─────────────────────────────────────────────────────────────────────────────
-GEMINI_CHART_PROMPT = """You are a senior technical analyst and financial journalist.
-
-Analyse the trading chart image in detail, then use your search capability to
-find the latest real-time market news related to the asset shown.
-
-Return ONLY valid JSON (no markdown, no extra text) in this exact structure:
-{
-  "asset":          "<ticker or name you identified from the chart>",
-  "timeframe":      "<detected or estimated timeframe>",
-  "current_price":  "<approximate price visible on chart>",
-  "trend":          "<Bullish | Bearish | Sideways>",
-  "key_levels": {
-    "support":    ["<level 1>", "<level 2>"],
-    "resistance": ["<level 1>", "<level 2>"]
-  },
-  "indicators": {
-    "<indicator name>": "<reading and interpretation>"
-  },
-  "chart_patterns":  ["<pattern 1>", "<pattern 2>"],
-  "technical_summary": "<3-4 sentence technical narrative>",
-  "live_news": [
-    {"headline": "<headline>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<source or search result>"},
-    {"headline": "<headline>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<source or search result>"},
-    {"headline": "<headline>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<source or search result>"}
-  ],
-  "news_summary": "<2 sentence summary of overall news sentiment>",
-  "gemini_vote":  "<UP|DOWN|WAIT>",
-  "gemini_confidence": <integer 0-100>,
-  "gemini_reasoning": "<one concise sentence>"
-}"""
-
-GEMINI_SYNTH_PROMPT_TPL = """You are the debate moderator and final decision-maker.
-
-Below is the complete debate transcript between five AI trading analysts.
-Study all initial positions and all cross-examination responses, then deliver
-a final verdict AND a precise candle-based trade recommendation.
-
-Chart timeframe detected by Gemini: {timeframe}
-
-=== DEBATE TRANSCRIPT ===
-{transcript}
-=========================
-
-RECOMMENDED ACTION rules (apply strictly):
-- If FINAL_DECISION is UP or DOWN:
-    * Estimate how many consecutive candles (1–5) the move is likely to last,
-      based on momentum, volume, and pattern strength visible in the debate.
-    * Calculate total_duration_minutes = candle_count × candle_duration_minutes.
-    * candle_duration_minutes must match the detected timeframe exactly
-      (e.g. 1 for 1-min, 5 for 5-min, 10 for 10-min, 15 for 15-min, 60 for 1H, etc.).
-    * Set should_trade to true.
-    * Set dont_trade_reason to null.
-    * Build display_text in exactly this format:
-      "TRADE DIRECTION: <UP|DOWN> | TARGET: Next <N> candles will go <UP|DOWN> (Duration: <total> minutes on a <tf>-min chart)"
-- If FINAL_DECISION is WAIT:
-    * Set should_trade to false, trade_direction to null, candle_count to null,
-      candle_duration_minutes to null, total_duration_minutes to null.
-    * Write a specific dont_trade_reason (volatility, low volume, conflicting signals, etc.).
-    * Build display_text in exactly this format:
-      "DON'T TRADE: <specific reason — market conditions, asset name, and timeframe>"
-
-Return ONLY valid JSON (no markdown):
-{{
-  "vote_tally": {{"UP": <int>, "DOWN": <int>, "WAIT": <int>}},
-  "consensus_strength": "<STRONG | MODERATE | DIVIDED>",
-  "key_agreements":    "<what the majority agreed on>",
-  "key_disagreements": "<main point(s) of disagreement>",
-  "FINAL_DECISION":    "<UP|DOWN|WAIT>",
-  "confidence":        <integer 0-100>,
-  "action":            "<one clear, actionable sentence for a trader>",
-  "moderator_note":    "<2-3 sentence moderator summary>",
-  "recommended_action": {{
-    "should_trade":             <true|false>,
-    "trade_direction":          "<UP|DOWN|null>",
-    "candle_count":             <integer or null>,
-    "candle_duration_minutes":  <integer or null>,
-    "total_duration_minutes":   <integer or null>,
-    "dont_trade_reason":        "<string or null>",
-    "display_text":             "<formatted string per rules above>"
-  }}
-}}"""
-
-
-def step1_gemini_analyze(image_bytes: bytes, mime: str) -> dict:
+def step1_gemini_analyze(image_bytes: bytes, mime: str, extra_ctx: str) -> dict:
+    from google import genai
     from google.genai import types
 
-    client = _gemini_client()
+    client = genai.Client(api_key=require_secret("GEMINI_API_KEY"))
+
+    extra = f"\n\nExtra context from user: {extra_ctx.strip()}" if extra_ctx.strip() else ""
+
+    prompt = (
+        "You are a senior technical analyst and financial journalist.\n\n"
+        "Analyse the trading chart image in full detail, then use Google Search "
+        "to find the latest real-time market news for the asset shown." + extra + "\n\n"
+        "Return ONLY valid JSON — no markdown, no extra text:\n"
+        "{\n"
+        '  "asset": "<ticker/name>",\n'
+        '  "timeframe": "<e.g. 10-min, 1H>",\n'
+        '  "timeframe_minutes": <integer minutes per candle>,\n'
+        '  "current_price": "<price on chart>",\n'
+        '  "trend": "<Bullish|Bearish|Sideways>",\n'
+        '  "support": ["<level>", "<level>"],\n'
+        '  "resistance": ["<level>", "<level>"],\n'
+        '  "indicators": {"<name>": "<reading>"},\n'
+        '  "patterns": ["<pattern>"],\n'
+        '  "technical_summary": "<3-4 sentence analysis>",\n'
+        '  "live_news": [\n'
+        '    {"headline": "<text>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<src>"},\n'
+        '    {"headline": "<text>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<src>"},\n'
+        '    {"headline": "<text>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<src>"}\n'
+        "  ],\n"
+        '  "news_summary": "<2-sentence sentiment summary>",\n'
+        '  "gemini_vote": "<UP|DOWN|WAIT>",\n'
+        '  "gemini_confidence": <0-100>,\n'
+        '  "gemini_reasoning": "<one concise sentence>"\n'
+        "}"
+    )
+
     contents = [
         types.Content(
             role="user",
             parts=[
                 types.Part(inline_data=types.Blob(mime_type=mime, data=image_bytes)),
-                types.Part(text=GEMINI_CHART_PROMPT),
+                types.Part(text=prompt),
             ],
         )
     ]
-    # Use search grounding for live news
+
     try:
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -194,107 +128,88 @@ def step1_gemini_analyze(image_bytes: bytes, mime: str) -> dict:
             ),
         )
     except Exception:
-        # Fallback without grounding if unavailable
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=contents,
         )
-    return _parse_json(resp.text)
+
+    return parse_json(resp.text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Initial votes from text-only models
+# STEP 2 — Groq: Llama 3, Mixtral, Gemma 2
 # ─────────────────────────────────────────────────────────────────────────────
-INITIAL_VOTE_PROMPT_TPL = """You are {model_name}, a specialist AI trading analyst.
-
-Gemini has analysed a trading chart and retrieved live market news. Your job is
-to study Gemini's findings and provide your own independent trading opinion.
-
-=== GEMINI'S CHART ANALYSIS ===
-Asset       : {asset}
-Timeframe   : {timeframe}
-Trend       : {trend}
-Support     : {support}
-Resistance  : {resistance}
-Indicators  : {indicators}
-Patterns    : {patterns}
-Technical   : {technical_summary}
-Gemini Vote : {gemini_vote} ({gemini_confidence}% confidence)
-Gemini Says : {gemini_reasoning}
-
-=== LIVE MARKET NEWS ===
-{news_block}
-
-News Summary: {news_summary}
-===============================
-
-Provide your own analysis and vote. Return ONLY valid JSON:
-{{
-  "model":      "{model_name}",
-  "analysis":   "<2-3 sentence technical + fundamental analysis>",
-  "key_risks":  ["<risk 1>", "<risk 2>"],
-  "vote":       "<UP|DOWN|WAIT>",
-  "confidence": <integer 0-100>,
-  "reasoning":  "<one concise sentence explaining your vote>"
-}}"""
-
-
-def _build_initial_prompt(model_name: str, g: dict) -> str:
+def build_analyst_prompt(model_name: str, g: dict) -> str:
     news_lines = "\n".join(
-        f"  [{i+1}] ({item.get('sentiment','?')}) {item.get('headline','')}"
-        f"  — {item.get('source','')}"
-        for i, item in enumerate(g.get("live_news", []))
-    )
-    indicators_str = "; ".join(
+        f"  • [{n.get('sentiment','?')}] {n.get('headline','')} — {n.get('source','')}"
+        for n in g.get("live_news", [])
+    ) or "  No live news retrieved."
+
+    indicators = "; ".join(
         f"{k}: {v}" for k, v in g.get("indicators", {}).items()
     ) or "N/A"
-    return INITIAL_VOTE_PROMPT_TPL.format(
-        model_name=model_name,
-        asset=g.get("asset", "Unknown"),
-        timeframe=g.get("timeframe", "Unknown"),
-        trend=g.get("trend", "Unknown"),
-        support=", ".join(g.get("key_levels", {}).get("support", [])),
-        resistance=", ".join(g.get("key_levels", {}).get("resistance", [])),
-        indicators=indicators_str,
-        patterns=", ".join(g.get("chart_patterns", [])),
-        technical_summary=g.get("technical_summary", ""),
-        gemini_vote=g.get("gemini_vote", "WAIT"),
-        gemini_confidence=g.get("gemini_confidence", 0),
-        gemini_reasoning=g.get("gemini_reasoning", ""),
-        news_block=news_lines or "No live news retrieved.",
-        news_summary=g.get("news_summary", ""),
+
+    return (
+        f"You are {model_name}, an expert AI trading analyst.\n\n"
+        "Gemini has analysed a trading chart and fetched live market news. "
+        "Study its findings and give your own independent trading opinion.\n\n"
+        "=== GEMINI CHART ANALYSIS ===\n"
+        f"Asset       : {g.get('asset','?')}\n"
+        f"Timeframe   : {g.get('timeframe','?')}\n"
+        f"Price       : {g.get('current_price','?')}\n"
+        f"Trend       : {g.get('trend','?')}\n"
+        f"Support     : {', '.join(g.get('support', []))}\n"
+        f"Resistance  : {', '.join(g.get('resistance', []))}\n"
+        f"Indicators  : {indicators}\n"
+        f"Patterns    : {', '.join(g.get('patterns', []))}\n"
+        f"Technical   : {g.get('technical_summary','')}\n"
+        f"Gemini Vote : {g.get('gemini_vote','?')} ({g.get('gemini_confidence',0)}%)\n"
+        f"Gemini Says : {g.get('gemini_reasoning','')}\n\n"
+        "=== LIVE MARKET NEWS ===\n"
+        f"{news_lines}\n"
+        f"Summary: {g.get('news_summary','')}\n"
+        "=========================\n\n"
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        f'  "model": "{model_name}",\n'
+        '  "analysis": "<2-3 sentence technical + fundamental view>",\n'
+        '  "key_risks": ["<risk 1>", "<risk 2>"],\n'
+        '  "vote": "<UP|DOWN|WAIT>",\n'
+        '  "confidence": <0-100>,\n'
+        '  "reasoning": "<one concise sentence>"\n'
+        "}"
     )
 
 
-GROQ_MODELS = [
-    ("llama3-70b-8192",   "Llama 3 70B"),
-    ("mixtral-8x7b-32768","Mixtral 8x7B"),
-    ("gemma2-9b-it",      "Gemma 2 9B"),
-]
+def groq_vote(model_id: str, model_name: str, gemini_data: dict) -> dict:
+    from groq import Groq
 
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+    client = Groq(api_key=require_secret("GROQ_API_KEY"))
+    prompt = build_analyst_prompt(model_name, gemini_data)
 
-
-def groq_initial_vote(model_id: str, model_name: str, gemini_data: dict) -> dict:
-    client = _groq_client()
-    prompt = _build_initial_prompt(model_name, gemini_data)
     chat = client.chat.completions.create(
         model=model_id,
         messages=[
             {"role": "system", "content": "You are an expert AI trading analyst. Always respond with valid JSON only."},
-            {"role": "user", "content": prompt},
+            {"role": "user",   "content": prompt},
         ],
         temperature=0.4,
         max_tokens=600,
     )
-    return _parse_json(chat.choices[0].message.content)
+    result = parse_json(chat.choices[0].message.content)
+    result.setdefault("model", model_name)
+    return result
 
 
-def deepseek_initial_vote(gemini_data: dict) -> dict:
-    api_key = _secret("DEEPSEEK_API_KEY")
-    prompt = _build_initial_prompt("DeepSeek-Chat", gemini_data)
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — DeepSeek
+# ─────────────────────────────────────────────────────────────────────────────
+def deepseek_vote(gemini_data: dict) -> dict:
+    api_key = require_secret("DEEPSEEK_API_KEY")
+    prompt  = build_analyst_prompt("DeepSeek-Chat", gemini_data)
+
     resp = requests.post(
-        DEEPSEEK_API_URL,
+        "https://api.deepseek.com/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -303,161 +218,95 @@ def deepseek_initial_vote(gemini_data: dict) -> dict:
             "model": "deepseek-chat",
             "messages": [
                 {"role": "system", "content": "You are an expert AI trading analyst. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt},
+                {"role": "user",   "content": prompt},
             ],
             "temperature": 0.4,
             "max_tokens": 600,
         },
-        timeout=30,
+        timeout=40,
     )
     resp.raise_for_status()
-    return _parse_json(resp.json()["choices"][0]["message"]["content"])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Cross-Examination round
-# ─────────────────────────────────────────────────────────────────────────────
-DEBATE_PROMPT_TPL = """You are {model_name}, participating in a structured
-cross-examination debate with four other AI trading analysts.
-
-=== INITIAL POSITIONS ===
-{initial_positions}
-=========================
-
-Your task:
-1. Address at least TWO other analysts by name — challenge, support, or
-   refine their arguments with specific technical or fundamental reasoning.
-2. State your FINAL refined vote for this debate round (can differ from your
-   initial if persuaded).
-
-Return ONLY valid JSON:
-{{
-  "model":             "{model_name}",
-  "responses_to": [
-    {{"target": "<model name>", "stance": "<AGREE|DISAGREE|PARTIALLY_AGREE>",
-      "argument": "<1-2 sentence specific technical rebuttal or support>"}},
-    {{"target": "<model name>", "stance": "<AGREE|DISAGREE|PARTIALLY_AGREE>",
-      "argument": "<1-2 sentence specific technical rebuttal or support>"}}
-  ],
-  "refined_vote":      "<UP|DOWN|WAIT>",
-  "refined_confidence":<integer 0-100>,
-  "final_reasoning":   "<one concise sentence>"
-}}"""
-
-
-def _build_positions_block(initial_votes: list[dict], gemini_data: dict) -> str:
-    gemini_block = (
-        f"• Gemini 2.5 Flash  →  {gemini_data.get('gemini_vote','WAIT')} "
-        f"({gemini_data.get('gemini_confidence',0)}%): "
-        f"{gemini_data.get('gemini_reasoning','')}"
-    )
-    analyst_blocks = "\n".join(
-        f"• {v.get('model', '?')}  →  {v.get('vote','WAIT')} "
-        f"({v.get('confidence',0)}%): {v.get('reasoning','')}"
-        for v in initial_votes
-    )
-    return gemini_block + "\n" + analyst_blocks
-
-
-def groq_debate(model_id: str, model_name: str,
-                initial_votes: list[dict], gemini_data: dict) -> dict:
-    client = _groq_client()
-    positions = _build_positions_block(initial_votes, gemini_data)
-    prompt = DEBATE_PROMPT_TPL.format(
-        model_name=model_name,
-        initial_positions=positions,
-    )
-    chat = client.chat.completions.create(
-        model=model_id,
-        messages=[
-            {"role": "system", "content": "You are an expert AI trading analyst in a live debate. Always respond with valid JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.5,
-        max_tokens=700,
-    )
-    return _parse_json(chat.choices[0].message.content)
-
-
-def deepseek_debate(initial_votes: list[dict], gemini_data: dict) -> dict:
-    api_key = _secret("DEEPSEEK_API_KEY")
-    positions = _build_positions_block(initial_votes, gemini_data)
-    prompt = DEBATE_PROMPT_TPL.format(
-        model_name="DeepSeek-Chat",
-        initial_positions=positions,
-    )
-    resp = requests.post(
-        DEEPSEEK_API_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "You are an expert AI trading analyst in a live debate. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.5,
-            "max_tokens": 700,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return _parse_json(resp.json()["choices"][0]["message"]["content"])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — Gemini final synthesis
-# ─────────────────────────────────────────────────────────────────────────────
-def step4_gemini_synthesize(gemini_data: dict,
-                             initial_votes: list[dict],
-                             debate_responses: list[dict]) -> dict:
-    from google.genai import types
-
-    lines = []
-    lines.append("── INITIAL POSITIONS ──")
-    lines.append(
-        f"Gemini 2.5 Flash: {gemini_data.get('gemini_vote','WAIT')} "
-        f"({gemini_data.get('gemini_confidence',0)}%) — "
-        f"{gemini_data.get('gemini_reasoning','')}"
-    )
-    for v in initial_votes:
-        lines.append(
-            f"{v.get('model','?')}: {v.get('vote','WAIT')} "
-            f"({v.get('confidence',0)}%) — {v.get('reasoning','')}"
-        )
-    lines.append("\n── CROSS-EXAMINATION RESPONSES ──")
-    for d in debate_responses:
-        lines.append(
-            f"\n{d.get('model','?')} [refined: {d.get('refined_vote','WAIT')} "
-            f"@ {d.get('refined_confidence',0)}%] — {d.get('final_reasoning','')}"
-        )
-        for r in d.get("responses_to", []):
-            lines.append(
-                f"  ↳ To {r.get('target','?')} [{r.get('stance','?')}]: "
-                f"{r.get('argument','')}"
-            )
-
-    transcript = "\n".join(lines)
-    timeframe = gemini_data.get("timeframe", "unknown")
-    prompt = GEMINI_SYNTH_PROMPT_TPL.format(transcript=transcript, timeframe=timeframe)
-
-    client = _gemini_client()
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-    )
-    result = _parse_json(resp.text)
-    result["_transcript"] = transcript
+    result = parse_json(resp.json()["choices"][0]["message"]["content"])
+    result.setdefault("model", "DeepSeek-Chat")
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI helpers
+# STEP 3 — Gemini final synthesis (cross-examination + verdict)
+# ─────────────────────────────────────────────────────────────────────────────
+def step3_gemini_synthesize(gemini_data: dict, analyst_votes: list[dict]) -> dict:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=require_secret("GEMINI_API_KEY"))
+
+    tf          = gemini_data.get("timeframe", "unknown")
+    tf_minutes  = gemini_data.get("timeframe_minutes", 0)
+
+    # Build positions block (no f-string interpolation into user content to avoid format issues)
+    positions = "Gemini 2.5 Flash: " + gemini_data.get("gemini_vote", "WAIT")
+    positions += f" ({gemini_data.get('gemini_confidence', 0)}%) — "
+    positions += gemini_data.get("gemini_reasoning", "") + "\n"
+    for v in analyst_votes:
+        positions += (
+            f"{v.get('model','?')}: {v.get('vote','WAIT')} "
+            f"({v.get('confidence',0)}%) — {v.get('reasoning','')}\n"
+            f"  Analysis: {v.get('analysis','')}\n"
+            f"  Key Risks: {', '.join(v.get('key_risks', []))}\n"
+        )
+
+    prompt = (
+        "You are the debate moderator and final decision-maker for a panel of "
+        "5 AI trading analysts.\n\n"
+        "=== ALL 5 ANALYST POSITIONS ===\n"
+        + positions +
+        "================================\n\n"
+        "Your tasks:\n"
+        "1. Cross-examine the positions — identify where models agree, disagree, "
+        "and why.\n"
+        "2. Deliver a FINAL_DECISION (UP, DOWN, or WAIT) based on the weight of evidence.\n"
+        "3. Compute a RECOMMENDED ACTION based on the chart timeframe:\n"
+        "   Chart timeframe: " + tf + " (" + str(tf_minutes) + " minutes per candle)\n"
+        "   - If FINAL_DECISION is UP or DOWN:\n"
+        "       * Estimate candle_count (1-5) for the expected move duration.\n"
+        "       * total_duration_minutes = candle_count × timeframe_minutes.\n"
+        "       * display_text format exactly:\n"
+        '         "TRADE DIRECTION: UP|DOWN | TARGET: Next N candles will go UP|DOWN '
+        '(Duration: X minutes on a Y-min chart)"\n'
+        "   - If FINAL_DECISION is WAIT:\n"
+        "       * display_text format exactly:\n"
+        '         "DON\'T TRADE: <specific reason with asset and timeframe>"\n\n'
+        "Return ONLY valid JSON — no markdown:\n"
+        "{\n"
+        '  "cross_examination": "<3-4 sentence moderator analysis of agreements and disagreements>",\n'
+        '  "vote_tally": {"UP": 0, "DOWN": 0, "WAIT": 0},\n'
+        '  "consensus_strength": "<STRONG|MODERATE|DIVIDED>",\n'
+        '  "FINAL_DECISION": "<UP|DOWN|WAIT>",\n'
+        '  "confidence": <0-100>,\n'
+        '  "moderator_note": "<2-3 sentence summary for the trader>",\n'
+        '  "recommended_action": {\n'
+        '    "should_trade": <true|false>,\n'
+        '    "trade_direction": "<UP|DOWN|null>",\n'
+        '    "candle_count": <integer or null>,\n'
+        '    "total_duration_minutes": <integer or null>,\n'
+        '    "dont_trade_reason": "<string or null>",\n'
+        '    "display_text": "<formatted string per rules above>"\n'
+        "  }\n"
+        "}"
+    )
+
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+    )
+    return parse_json(resp.text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI constants
 # ─────────────────────────────────────────────────────────────────────────────
 VOTE_COLOR = {"UP": "green", "DOWN": "red", "WAIT": "orange"}
-VOTE_ICON  = {"UP": "⬆️", "DOWN": "⬇️", "WAIT": "⏸️"}
+VOTE_ICON  = {"UP": "⬆️",   "DOWN": "⬇️", "WAIT": "⏸️"}
 MODEL_ICON = {
     "Gemini 2.5 Flash": "✨",
     "Llama 3 70B":      "🦙",
@@ -467,33 +316,36 @@ MODEL_ICON = {
 }
 
 
-def _vote_badge(vote: str) -> str:
+def badge(vote: str) -> str:
     c = VOTE_COLOR.get(vote, "gray")
     i = VOTE_ICON.get(vote, "❓")
     return f":{c}[**{i} {vote}**]"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Render: Gemini chart analysis
+# ─────────────────────────────────────────────────────────────────────────────
 def render_gemini_analysis(g: dict):
     with st.expander("✨ Gemini 2.5 Flash — Chart Analysis + Live News", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Asset", g.get("asset", "—"))
+        c1.metric("Asset",     g.get("asset", "—"))
         c2.metric("Timeframe", g.get("timeframe", "—"))
-        c3.metric("Trend", g.get("trend", "—"))
-        vote = g.get("gemini_vote", "WAIT")
-        c4.metric("Gemini Vote", f"{VOTE_ICON.get(vote,'')} {vote}", f"{g.get('gemini_confidence',0)}% confidence")
+        c3.metric("Trend",     g.get("trend", "—"))
+        v = g.get("gemini_vote", "WAIT")
+        c4.metric("Gemini Vote", f"{VOTE_ICON.get(v,'')} {v}",
+                  f"{g.get('gemini_confidence',0)}% confidence")
 
         st.markdown("**Technical Summary**")
         st.info(g.get("technical_summary", ""))
 
-        lvls = g.get("key_levels", {})
         ca, cb = st.columns(2)
         with ca:
-            st.markdown("**Support Levels**")
-            for s in lvls.get("support", []):
+            st.markdown("**Support**")
+            for s in g.get("support", []):
                 st.markdown(f"- `{s}`")
         with cb:
-            st.markdown("**Resistance Levels**")
-            for r in lvls.get("resistance", []):
+            st.markdown("**Resistance**")
+            for r in g.get("resistance", []):
                 st.markdown(f"- `{r}`")
 
         inds = g.get("indicators", {})
@@ -502,170 +354,161 @@ def render_gemini_analysis(g: dict):
             for k, v in inds.items():
                 st.markdown(f"- **{k}**: {v}")
 
-        if g.get("chart_patterns"):
-            st.markdown("**Patterns detected:** " + " · ".join(f"`{p}`" for p in g["chart_patterns"]))
+        if g.get("patterns"):
+            st.markdown("**Patterns:** " + " · ".join(f"`{p}`" for p in g["patterns"]))
 
         st.markdown("---")
         st.markdown("**📰 Live Market News**")
         for item in g.get("live_news", []):
             sent = item.get("sentiment", "Neutral")
-            icon = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
-            st.markdown(f"{icon} **{item.get('headline','')}**  \n*{item.get('source','')}*")
+            dot  = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
+            st.markdown(f"{dot} **{item.get('headline','')}**  \n*{item.get('source','')}*")
 
-        st.markdown(f"**News Sentiment Summary:** {g.get('news_summary','')}")
+        st.markdown(f"**News Summary:** {g.get('news_summary','')}")
         st.markdown(f"💬 *{g.get('gemini_reasoning','')}*")
 
 
-def render_initial_vote(v: dict):
+# ─────────────────────────────────────────────────────────────────────────────
+# Render: individual analyst vote card
+# ─────────────────────────────────────────────────────────────────────────────
+def render_vote_card(v: dict):
     model = v.get("model", "Unknown")
     vote  = v.get("vote", "WAIT")
     icon  = MODEL_ICON.get(model, "🤖")
     with st.expander(
-        f"{icon} **{model}** — {_vote_badge(vote)} — {v.get('confidence',0)}% confidence",
+        f"{icon} **{model}** — {badge(vote)} — {v.get('confidence', 0)}% confidence",
         expanded=True,
     ):
-        st.markdown(f"**Analysis:** {v.get('analysis','')}")
+        st.markdown(f"**Analysis:** {v.get('analysis', '')}")
         risks = v.get("key_risks", [])
         if risks:
             st.markdown("**Key Risks:** " + " · ".join(f"`{r}`" for r in risks))
-        st.markdown(f"💬 *{v.get('reasoning','')}*")
+        st.markdown(f"💬 *{v.get('reasoning', '')}*")
 
 
-def render_debate_response(d: dict):
-    model = d.get("model", "Unknown")
-    vote  = d.get("refined_vote", "WAIT")
-    icon  = MODEL_ICON.get(model, "🤖")
-    with st.expander(
-        f"{icon} **{model}** — Refined: {_vote_badge(vote)} — {d.get('refined_confidence',0)}%",
-        expanded=True,
-    ):
-        for r in d.get("responses_to", []):
-            stance = r.get("stance", "?")
-            s_icon = "✅" if stance == "AGREE" else ("❌" if stance == "DISAGREE" else "🔄")
-            st.markdown(
-                f"{s_icon} **To {r.get('target','?')}** [{stance}]: {r.get('argument','')}"
-            )
-        st.markdown(f"💬 *Final reasoning: {d.get('final_reasoning','')}*")
+# ─────────────────────────────────────────────────────────────────────────────
+# Render: vote summary scoreboard
+# ─────────────────────────────────────────────────────────────────────────────
+def render_vote_scoreboard(gemini_data: dict, analyst_votes: list[dict]):
+    st.markdown("### 🗳️ All 5 AI Votes at a Glance")
 
+    all_votes = [
+        {
+            "model": "✨ Gemini 2.5 Flash",
+            "vote":  gemini_data.get("gemini_vote", "WAIT"),
+            "conf":  gemini_data.get("gemini_confidence", 0),
+        }
+    ] + [
+        {
+            "model": MODEL_ICON.get(v.get("model",""), "🤖") + " " + v.get("model","?"),
+            "vote":  v.get("vote", "WAIT"),
+            "conf":  v.get("confidence", 0),
+        }
+        for v in analyst_votes
+    ]
 
-def render_trade_recommendation(synth: dict):
-    """Render the bold highlighted RECOMMENDED ACTION box at the very bottom."""
-    ra = synth.get("recommended_action", {})
-    if not ra:
-        return
-
-    should_trade = ra.get("should_trade", False)
-    display_text = ra.get("display_text", "")
-    direction    = ra.get("trade_direction", "")
-    candles      = ra.get("candle_count")
-    tf_mins      = ra.get("candle_duration_minutes")
-    total_mins   = ra.get("total_duration_minutes")
-    no_trade_rsn = ra.get("dont_trade_reason", "")
-
-    st.markdown("---")
-    st.markdown("## 🎯 Recommended Action")
-
-    if should_trade and direction in ("UP", "DOWN"):
-        bg_color  = "#0a3d0a" if direction == "UP" else "#3d0a0a"
-        txt_color = "#00ff88" if direction == "UP" else "#ff4444"
-        border    = "#00cc66" if direction == "UP" else "#cc0000"
-        arrow     = "⬆️" if direction == "UP" else "⬇️"
-
-        st.markdown(
-            f"""
-            <div style="
-                background-color:{bg_color};
-                border:3px solid {border};
-                border-radius:12px;
-                padding:28px 32px;
-                margin:12px 0 8px 0;
-                text-align:center;
-            ">
-                <div style="font-size:2rem;margin-bottom:8px;">{arrow}</div>
-                <div style="
-                    color:{txt_color};
-                    font-size:1.55rem;
-                    font-weight:900;
-                    letter-spacing:0.02em;
-                    line-height:1.5;
-                ">{display_text}</div>
-            </div>
-            """,
+    cols = st.columns(len(all_votes))
+    for col, entry in zip(cols, all_votes):
+        vote  = entry["vote"]
+        color = VOTE_COLOR.get(vote, "gray")
+        icon  = VOTE_ICON.get(vote, "❓")
+        col.markdown(
+            f"<div style='text-align:center;padding:12px 4px;border:1px solid #444;"
+            f"border-radius:8px;'>"
+            f"<div style='font-size:0.72rem;color:#aaa;margin-bottom:4px;'>{entry['model']}</div>"
+            f"<div style='font-size:1.6rem;'>{icon}</div>"
+            f"<div style='font-size:1rem;font-weight:800;color:{color};'>{vote}</div>"
+            f"<div style='font-size:0.72rem;color:#aaa;'>{entry['conf']}% conf</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
-        if candles and tf_mins and total_mins:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Trade Direction", f"{arrow} {direction}")
-            c2.metric("Candles to Hold", f"{candles} candle{'s' if candles != 1 else ''}")
-            c3.metric("Estimated Duration", f"{total_mins} min")
 
-    else:
-        st.markdown(
-            f"""
-            <div style="
-                background-color:#2d2200;
-                border:3px solid #cc8800;
-                border-radius:12px;
-                padding:28px 32px;
-                margin:12px 0 8px 0;
-                text-align:center;
-            ">
-                <div style="font-size:2rem;margin-bottom:8px;">🚫</div>
-                <div style="
-                    color:#ffcc00;
-                    font-size:1.55rem;
-                    font-weight:900;
-                    letter-spacing:0.02em;
-                    line-height:1.5;
-                ">{display_text}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        if no_trade_rsn and no_trade_rsn not in ("null", ""):
-            st.warning(f"⚠️ **Reason:** {no_trade_rsn}")
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Render: final decision
+# ─────────────────────────────────────────────────────────────────────────────
 def render_final_decision(synth: dict):
-    decision   = synth.get("FINAL_DECISION", "WAIT")
-    color      = VOTE_COLOR.get(decision, "gray")
-    arrow      = VOTE_ICON.get(decision, "❓")
-    strength   = synth.get("consensus_strength", "")
-    tally      = synth.get("vote_tally", {})
-    confidence = synth.get("confidence", 0)
+    decision  = synth.get("FINAL_DECISION", "WAIT")
+    color     = VOTE_COLOR.get(decision, "gray")
+    arrow     = VOTE_ICON.get(decision, "❓")
+    strength  = synth.get("consensus_strength", "")
+    tally     = synth.get("vote_tally", {})
+    conf      = synth.get("confidence", 0)
 
     st.markdown("---")
     st.markdown("## 🏆 Final Consensus Decision")
 
     st.markdown(
-        f"<div style='text-align:center;padding:24px 0 8px;'>"
-        f"<span style='font-size:5rem;font-weight:900;color:{color};'>"
+        f"<div style='text-align:center;padding:20px 0 6px;'>"
+        f"<span style='font-size:4.5rem;font-weight:900;color:{color};'>"
         f"{arrow} {decision}</span></div>"
-        f"<p style='text-align:center;font-size:1.1rem;margin-top:0;'>"
-        f"Consensus Strength: <strong>{strength}</strong> &nbsp;|&nbsp; "
-        f"Confidence: <strong>{confidence}%</strong></p>",
+        f"<p style='text-align:center;font-size:1.05rem;margin-top:0;'>"
+        f"Consensus: <strong>{strength}</strong> &nbsp;|&nbsp; "
+        f"Confidence: <strong>{conf}%</strong></p>",
         unsafe_allow_html=True,
     )
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("⬆️ UP", tally.get("UP", 0))
+    c1.metric("⬆️ UP",   tally.get("UP",   0))
     c2.metric("⬇️ DOWN", tally.get("DOWN", 0))
     c3.metric("⏸️ WAIT", tally.get("WAIT", 0))
 
-    st.success(f"✅ **Recommended Action:** {synth.get('action','')}")
-    st.markdown(f"**Moderator Note:** {synth.get('moderator_note','')}")
+    st.markdown(f"**Cross-Examination Summary:** {synth.get('cross_examination','')}")
+    st.info(f"📋 **Moderator Note:** {synth.get('moderator_note','')}")
 
-    agreed    = synth.get("key_agreements", "")
-    disagreed = synth.get("key_disagreements", "")
-    if agreed:
-        st.markdown(f"**Agreed on:** {agreed}")
-    if disagreed and disagreed.lower() not in ("", "none"):
-        st.warning(f"⚠️ **Disagreements:** {disagreed}")
 
-    with st.expander("📋 Full Debate Transcript", expanded=False):
-        st.code(synth.get("_transcript", ""), language="")
+# ─────────────────────────────────────────────────────────────────────────────
+# Render: trade recommendation box
+# ─────────────────────────────────────────────────────────────────────────────
+def render_trade_recommendation(synth: dict):
+    ra = synth.get("recommended_action", {})
+    if not ra:
+        return
+
+    should_trade  = ra.get("should_trade", False)
+    display_text  = ra.get("display_text", "")
+    direction     = ra.get("trade_direction") or ""
+    candles       = ra.get("candle_count")
+    total_mins    = ra.get("total_duration_minutes")
+    no_trade_rsn  = ra.get("dont_trade_reason") or ""
+
+    st.markdown("---")
+    st.markdown("## 🎯 Recommended Action")
+
+    if should_trade and direction in ("UP", "DOWN"):
+        bg     = "#062e0f" if direction == "UP" else "#2e0606"
+        txt    = "#00e676" if direction == "UP" else "#ff5252"
+        border = "#00c853" if direction == "UP" else "#d50000"
+        arrow  = "⬆️"     if direction == "UP" else "⬇️"
+
+        st.markdown(
+            f"<div style='background:{bg};border:3px solid {border};border-radius:14px;"
+            f"padding:30px 24px;margin:10px 0;text-align:center;'>"
+            f"<div style='font-size:2.4rem;'>{arrow}</div>"
+            f"<div style='color:{txt};font-size:1.5rem;font-weight:900;"
+            f"letter-spacing:.02em;line-height:1.55;margin-top:8px;'>"
+            f"{display_text}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        if candles and total_mins:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Direction",     f"{arrow} {direction}")
+            m2.metric("Candles to Hold", f"{candles}")
+            m3.metric("Est. Duration",   f"{total_mins} min")
+
+    else:
+        st.markdown(
+            f"<div style='background:#2b1e00;border:3px solid #ff8f00;border-radius:14px;"
+            f"padding:30px 24px;margin:10px 0;text-align:center;'>"
+            f"<div style='font-size:2.4rem;'>🚫</div>"
+            f"<div style='color:#ffd740;font-size:1.5rem;font-weight:900;"
+            f"letter-spacing:.02em;line-height:1.55;margin-top:8px;'>"
+            f"{display_text}</div></div>",
+            unsafe_allow_html=True,
+        )
+        if no_trade_rsn and no_trade_rsn.lower() not in ("null", "none", ""):
+            st.warning(f"⚠️ {no_trade_rsn}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -673,163 +516,115 @@ def render_final_decision(synth: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 st.title("📊 AI Trading Debate")
 st.caption(
-    "Five live AI models analyse your chart, debate each other, and deliver a "
-    "consensus **UP / DOWN / WAIT** decision."
+    "Gemini reads your chart + live news → 4 models vote independently → "
+    "Gemini cross-examines all 5 opinions → **FINAL DECISION + candle target**"
 )
 
-st.markdown("### Upload Chart")
+st.markdown("### 1️⃣  Upload Chart")
 uploaded = st.file_uploader(
     "Upload Image",
     type=["png", "jpg", "jpeg", "webp"],
-    help="Screenshot of any trading chart (candlestick, line, Heikin-Ashi, etc.)",
+    help="Screenshot of any trading chart",
 )
-
 if uploaded:
-    img = Image.open(uploaded)
-    st.image(img, caption="Uploaded chart", use_container_width=True)
+    st.image(Image.open(uploaded), caption="Uploaded chart", use_container_width=True)
 
-st.markdown("### Additional Context *(optional)*")
+st.markdown("### 2️⃣  Extra Context *(optional)*")
 extra_ctx = st.text_area(
-    "Paste any extra context you want the AIs to consider",
-    placeholder="e.g. I'm watching BTC/USDT 10-min chart during the NY session…",
-    height=80,
+    "Any context for the AIs",
+    placeholder="e.g. BTC/USDT 10-min chart, NY session open…",
+    height=70,
 )
 
-st.markdown("### Start the Debate")
-
-col_btn, col_info = st.columns([2, 3])
-with col_btn:
-    run = st.button(
-        "🚀 START AI DEBATE",
-        disabled=uploaded is None,
-        use_container_width=True,
-        type="primary",
-    )
-with col_info:
-    st.caption(
-        "Pipeline: Gemini vision → Llama 3 / Mixtral / Gemma 2 / DeepSeek "
-        "initial votes → Cross-Examination → Gemini final synthesis"
-    )
+st.markdown("### 3️⃣  Start")
+run = st.button(
+    "🚀 START AI DEBATE",
+    disabled=(uploaded is None),
+    use_container_width=True,
+    type="primary",
+)
 
 if not run:
     st.stop()
 
-if uploaded is None:
-    st.error("Please upload a chart image first.")
-    st.stop()
-
-# ── Read image ────────────────────────────────────────────────────────────────
+# Read image bytes
 uploaded.seek(0)
 image_bytes = uploaded.read()
-ext = uploaded.name.rsplit(".", 1)[-1].lower()
+ext      = uploaded.name.rsplit(".", 1)[-1].lower()
 mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "png": "image/png", "webp": "image/webp"}
+            "png": "image/png",  "webp": "image/webp"}
 mime_type = mime_map.get(ext, "image/jpeg")
-
-if extra_ctx.strip():
-    GEMINI_CHART_PROMPT_USED = (
-        GEMINI_CHART_PROMPT
-        + f"\n\nAdditional context from the user: {extra_ctx.strip()}"
-    )
-else:
-    GEMINI_CHART_PROMPT_USED = GEMINI_CHART_PROMPT
 
 st.markdown("---")
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Gemini chart analysis + live news
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("## Step 1 — Gemini Chart Analysis & Live News")
-with st.spinner("✨ Gemini 2.5 Flash is reading the chart and searching for live news…"):
+with st.spinner("✨ Gemini is reading the chart and fetching live news…"):
     try:
-        gemini_data = step1_gemini_analyze(image_bytes, mime_type)
-        # inject extra context into prompt used
-        if extra_ctx.strip() and "technical_summary" in gemini_data:
-            gemini_data["_extra_ctx"] = extra_ctx.strip()
+        gemini_data = step1_gemini_analyze(image_bytes, mime_type, extra_ctx)
     except Exception as exc:
-        st.error(f"Gemini error: {exc}")
+        st.error(f"Gemini Step 1 error: {exc}")
         st.stop()
 
 render_gemini_analysis(gemini_data)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 2 — Initial votes from all four text models
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — Independent votes from Llama 3, Mixtral, Gemma 2, DeepSeek
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
-st.markdown("## Step 2 — Independent Initial Votes")
+st.markdown("## Step 2 — Independent Analyst Votes")
 
-initial_votes: list[dict] = []
-
-text_models = [
-    ("groq",     "llama3-70b-8192",    "Llama 3 70B"),
-    ("groq",     "mixtral-8x7b-32768", "Mixtral 8x7B"),
-    ("groq",     "gemma2-9b-it",       "Gemma 2 9B"),
-    ("deepseek", None,                  "DeepSeek-Chat"),
+GROQ_MODELS = [
+    ("llama3-70b-8192",    "Llama 3 70B"),
+    ("mixtral-8x7b-32768", "Mixtral 8x7B"),
+    ("gemma2-9b-it",       "Gemma 2 9B"),
 ]
 
-for backend, model_id, model_name in text_models:
+analyst_votes: list[dict] = []
+
+for model_id, model_name in GROQ_MODELS:
     icon = MODEL_ICON.get(model_name, "🤖")
-    with st.spinner(f"{icon} {model_name} is forming an independent opinion…"):
+    with st.spinner(f"{icon} {model_name} (Groq) is forming its opinion…"):
         try:
-            if backend == "groq":
-                result = groq_initial_vote(model_id, model_name, gemini_data)
-            else:
-                result = deepseek_initial_vote(gemini_data)
-            result.setdefault("model", model_name)
-            initial_votes.append(result)
-            render_initial_vote(result)
+            result = groq_vote(model_id, model_name, gemini_data)
+            analyst_votes.append(result)
+            render_vote_card(result)
         except Exception as exc:
-            st.warning(f"{model_name} error (skipping): {exc}")
-            initial_votes.append({
-                "model": model_name,
-                "analysis": f"API error: {exc}",
-                "key_risks": [],
-                "vote": "WAIT",
-                "confidence": 0,
-                "reasoning": "Unable to retrieve response.",
+            st.warning(f"{model_name} error: {exc}")
+            analyst_votes.append({
+                "model": model_name, "analysis": f"Error: {exc}",
+                "key_risks": [], "vote": "WAIT", "confidence": 0,
+                "reasoning": "API call failed.",
             })
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 3 — Cross-Examination / Debate Round
-# ═══════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("## Step 3 — Cross-Examination Debate Round")
-st.caption("Each AI critiques the others and refines its position.")
-
-debate_responses: list[dict] = []
-
-for backend, model_id, model_name in text_models:
-    icon = MODEL_ICON.get(model_name, "🤖")
-    with st.spinner(f"{icon} {model_name} is cross-examining the other analysts…"):
-        try:
-            if backend == "groq":
-                resp = groq_debate(model_id, model_name, initial_votes, gemini_data)
-            else:
-                resp = deepseek_debate(initial_votes, gemini_data)
-            resp.setdefault("model", model_name)
-            debate_responses.append(resp)
-            render_debate_response(resp)
-        except Exception as exc:
-            st.warning(f"{model_name} debate error (skipping): {exc}")
-            debate_responses.append({
-                "model": model_name,
-                "responses_to": [],
-                "refined_vote": initial_votes[text_models.index((backend, model_id, model_name))].get("vote", "WAIT"),
-                "refined_confidence": 0,
-                "final_reasoning": f"Error: {exc}",
-            })
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STEP 4 — Gemini final synthesis
-# ═══════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown("## Step 4 — Final Synthesis")
-
-with st.spinner("✨ Gemini is moderating the debate and computing the final verdict…"):
+with st.spinner("🔭 DeepSeek-Chat is forming its opinion…"):
     try:
-        synthesis = step4_gemini_synthesize(gemini_data, initial_votes, debate_responses)
+        ds = deepseek_vote(gemini_data)
+        analyst_votes.append(ds)
+        render_vote_card(ds)
     except Exception as exc:
-        st.error(f"Synthesis error: {exc}")
+        st.warning(f"DeepSeek error: {exc}")
+        analyst_votes.append({
+            "model": "DeepSeek-Chat", "analysis": f"Error: {exc}",
+            "key_risks": [], "vote": "WAIT", "confidence": 0,
+            "reasoning": "API call failed.",
+        })
+
+# Scoreboard — all 5 votes at a glance
+render_vote_scoreboard(gemini_data, analyst_votes)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Gemini cross-examination + final synthesis
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown("## Step 3 — Gemini Cross-Examination & Final Verdict")
+with st.spinner("✨ Gemini is cross-examining all 5 opinions and computing the final verdict…"):
+    try:
+        synthesis = step3_gemini_synthesize(gemini_data, analyst_votes)
+    except Exception as exc:
+        st.error(f"Step 3 synthesis error: {exc}")
         st.stop()
 
 render_final_decision(synthesis)
