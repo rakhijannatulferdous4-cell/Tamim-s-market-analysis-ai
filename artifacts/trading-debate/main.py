@@ -168,6 +168,80 @@ def _discover_groq_vision_models() -> list[tuple[str, str]]:
         return []
 
 
+# Keywords that disqualify a model from the text-analyst pool
+_GROQ_TEXT_EXCLUDE = frozenset(
+    ["vision", "whisper", "guard", "embed", "tts", "preview", "distil"]
+)
+
+# Hardcoded safe fallback if the live API call fails
+_GROQ_TEXT_FALLBACK = [
+    ("llama-3.3-70b-versatile", "Llama 3.3 70B"),
+    ("mixtral-8x7b-32768",      "Mixtral 8x7B"),
+    ("llama-3.1-8b-instant",    "Llama 3.1 8B"),
+]
+
+
+def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
+    """
+    Query Groq's live /models endpoint and return up to `n` text-only models
+    ranked by quality heuristic (family + parameter count).
+
+    Excludes vision, audio, guard, and embed models so only pure text
+    chat models are returned.  Falls back to _GROQ_TEXT_FALLBACK if the
+    API call fails or returns no usable models.
+    """
+    try:
+        from groq import Groq
+        client  = Groq(api_key=require_secret("GROQ_API_KEY"))
+        listing = client.models.list()
+
+        candidates: list[tuple[int, str]] = []
+        for m in listing.data:
+            mid = m.id.lower()
+            if any(x in mid for x in _GROQ_TEXT_EXCLUDE):
+                continue
+            # Score by model family (higher = more capable / newer)
+            score = 0
+            if "llama-3.3"     in mid: score += 100
+            elif "llama-3.2"   in mid: score += 80
+            elif "llama-3.1"   in mid: score += 70
+            elif "llama-3"     in mid: score += 60
+            elif "mixtral"     in mid: score += 55
+            elif "gemma"       in mid: score += 50
+            elif "qwen"        in mid: score += 45
+            else:                      score += 10
+            # Bonus for larger parameter counts
+            if   any(x in mid for x in ["70b", "72b"]): score += 30
+            elif any(x in mid for x in ["34b", "13b"]): score += 20
+            elif "8b"  in mid:                           score += 15
+            elif "7b"  in mid:                           score += 12
+            candidates.append((score, m.id))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        result = [(mid, mid) for _, mid in candidates[:n]]
+        return result if result else _GROQ_TEXT_FALLBACK[:n]
+    except Exception:
+        return _GROQ_TEXT_FALLBACK[:n]
+
+
+def _short_label(model_id: str) -> str:
+    """Return a human-readable short label for any Groq model ID."""
+    mid = model_id.lower()
+    # Extract parameter size if present
+    for size in ["70b", "72b", "34b", "13b", "8b", "7b", "9b"]:
+        if size in mid:
+            # Find family
+            if "llama-3.3" in mid: return f"Llama 3.3 {size.upper()}"
+            if "llama-3.2" in mid: return f"Llama 3.2 {size.upper()}"
+            if "llama-3.1" in mid: return f"Llama 3.1 {size.upper()}"
+            if "llama-3"   in mid: return f"Llama 3 {size.upper()}"
+            if "mixtral"   in mid: return f"Mixtral {size.upper()}"
+            if "gemma"     in mid: return f"Gemma {size.upper()}"
+            if "qwen"      in mid: return f"Qwen {size.upper()}"
+    # Fallback: capitalise the raw ID
+    return model_id.split("/")[-1].replace("-", " ").title()
+
+
 def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str,
                           model_id: str, model_label: str) -> dict:
     from groq import Groq
@@ -476,7 +550,7 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
         from groq import Groq
         client = Groq(api_key=require_secret("GROQ_API_KEY"))
         chat   = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=_GROQ_TEXT_FALLBACK[0][0],
             messages=[
                 {"role": "system", "content": "You are a trading debate moderator. Respond with valid JSON only."},
                 {"role": "user",   "content": p},
@@ -781,12 +855,23 @@ render_chart_analysis(chart_data, vision_status)
 st.markdown("---")
 st.markdown("## Step 2 — Independent Analyst Votes")
 
-ANALYST_MODELS = [
-    ("groq",     "llama-3.3-70b-versatile", "Llama 3.3 70B"),
-    ("groq",     "mixtral-8x7b-32768",      "Mixtral 8x7B"),
-    ("groq",     "llama-3.1-8b-instant",    "Llama 3.1 8B"),
-    ("deepseek", None,                       "DeepSeek-Chat"),
+# ── Dynamic analyst roster ────────────────────────────────────────────────────
+# Ask Groq's live API which text models are currently active, rank them by
+# quality, and pick the top 3.  DeepSeek is always appended as analyst 4
+# (handled gracefully if payment fails).
+with st.spinner("🔍 Discovering active Groq text models…"):
+    _groq_text_models = _discover_groq_text_models(n=3)
+
+ANALYST_MODELS: list[tuple[str, str | None, str]] = [
+    ("groq", mid, _short_label(mid))
+    for mid, _ in _groq_text_models
+] + [
+    ("deepseek", None, "DeepSeek-Chat"),
 ]
+
+# Show which models were auto-selected
+_groq_labels = ", ".join(_short_label(mid) for mid, _ in _groq_text_models)
+st.caption(f"🤖 Auto-selected Groq analysts: **{_groq_labels}**")
 
 analyst_votes: list[dict] = []
 offline_models: list[str] = []
