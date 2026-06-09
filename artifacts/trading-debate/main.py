@@ -157,7 +157,7 @@ def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str) -> dict:
     )
 
     chat = client.chat.completions.create(
-        model="llama-3.2-11b-vision-preview",
+        model="llama-3.2-90b-vision-preview",
         messages=[
             {
                 "role": "user",
