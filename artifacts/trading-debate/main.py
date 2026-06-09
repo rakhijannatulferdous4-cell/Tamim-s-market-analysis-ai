@@ -60,6 +60,10 @@ def require_secret(key: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_json(text: str) -> dict:
     raw = text or ""
+    # Strip reasoning tokens emitted by thinking models (Qwen3, DeepSeek-R1, etc.)
+    # Everything inside <think>…</think> is internal monologue, not output JSON.
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # Strip markdown code fences
     if "```json" in raw:
         raw = raw.split("```json", 1)[1].split("```", 1)[0]
     elif "```" in raw:
