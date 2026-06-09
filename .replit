@@ -29,8 +29,8 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "cd artifacts/trading-debate && python -m streamlit run main.py --server.port 8008 --server.address 0.0.0.0 --server.headless true"
-waitForPort = 8008
+args = "cd artifacts/trading-debate && python -m streamlit run main.py --server.port 8000 --server.address 0.0.0.0 --server.headless true"
+waitForPort = 8000
 
 [agent]
 stack = "PNPM_WORKSPACE"
@@ -55,6 +55,14 @@ externalPort = 80
 [[ports]]
 localPort = 8081
 externalPort = 8081
+
+[[ports]]
+localPort = 8082
+externalPort = 3002
+
+[[ports]]
+localPort = 8083
+externalPort = 3003
 
 [nix]
 channel = "stable-25_05"

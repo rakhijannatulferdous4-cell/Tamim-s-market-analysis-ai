@@ -144,20 +144,29 @@ def _gemini_analyze(image_bytes: bytes, mime: str, extra: str) -> dict:
     return result
 
 
-def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str) -> dict:
+# Active Groq vision models to try in order (2026)
+# Llama 4 Scout and Maverick are multimodal; listed newest-first as fallbacks.
+GROQ_VISION_MODELS = [
+    ("meta-llama/llama-4-scout-17b-16e-instruct",    "Llama 4 Scout 17B (Groq)"),
+    ("meta-llama/llama-4-maverick-17b-128e-instruct", "Llama 4 Maverick 17B (Groq)"),
+]
+
+
+def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str,
+                          model_id: str, model_label: str) -> dict:
     from groq import Groq
 
-    client    = Groq(api_key=require_secret("GROQ_API_KEY"))
-    b64_image = base64.b64encode(image_bytes).decode()
+    client     = Groq(api_key=require_secret("GROQ_API_KEY"))
+    b64_image  = base64.b64encode(image_bytes).decode()
     extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
-    prompt    = (
+    prompt     = (
         CHART_PROMPT_PREFIX + extra_line + "\n" + CHART_ANALYSIS_JSON_SPEC
-        + "\n\nNote: You do not have live search. Fill live_news with your best "
+        + "\n\nNote: You may not have live search. Fill live_news with your best "
         "knowledge of recent market events for the asset shown."
     )
 
     chat = client.chat.completions.create(
-        model="llama-3.2-90b-vision-preview",
+        model=model_id,
         messages=[
             {
                 "role": "user",
@@ -174,7 +183,7 @@ def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str) -> dict:
         max_tokens=1800,
     )
     result = parse_json(chat.choices[0].message.content)
-    result["vision_model"] = "Llama 3.2 11B Vision (Groq)"
+    result["vision_model"] = model_label
     result.setdefault("gemini_vote",       result.get("vote", "WAIT"))
     result.setdefault("gemini_confidence", result.get("confidence", 50))
     result.setdefault("gemini_reasoning",  result.get("reasoning", "Fallback vision model."))
@@ -182,24 +191,48 @@ def _groq_vision_analyze(image_bytes: bytes, mime: str, extra: str) -> dict:
 
 
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
-    """Returns (chart_data, status_message)."""
-    try:
-        data = _gemini_analyze(image_bytes, mime, extra)
-        return data, "✨ Gemini 2.5 Flash — chart analysis complete."
-    except Exception as gemini_err:
+    """
+    Returns (chart_data, status_message).
+    Strategy:
+      1. Try Gemini up to 3 times with a 3-second pause between attempts
+         (503 demand spikes usually clear within seconds).
+      2. If all Gemini attempts fail, try each Groq vision model in order
+         until one succeeds.
+      3. If everything fails, raise a RuntimeError with a full error log.
+    """
+    GEMINI_RETRIES = 3
+    GEMINI_DELAY   = 3  # seconds between retries
+
+    gemini_errors = []
+    for attempt in range(1, GEMINI_RETRIES + 1):
         try:
-            data = _groq_vision_analyze(image_bytes, mime, extra)
+            data = _gemini_analyze(image_bytes, mime, extra)
+            suffix = f" (attempt {attempt}/{GEMINI_RETRIES})" if attempt > 1 else ""
+            return data, f"✨ Gemini 2.5 Flash — chart analysis complete{suffix}."
+        except Exception as exc:
+            gemini_errors.append(f"Attempt {attempt}: {type(exc).__name__}: {str(exc)[:120]}")
+            if attempt < GEMINI_RETRIES:
+                time.sleep(GEMINI_DELAY)
+
+    # All Gemini retries exhausted — try Groq vision models in sequence
+    groq_errors = []
+    for model_id, model_label in GROQ_VISION_MODELS:
+        try:
+            data = _groq_vision_analyze(image_bytes, mime, extra, model_id, model_label)
+            gemini_summary = " | ".join(gemini_errors)
             return data, (
-                f"⚠️ Gemini unavailable ({type(gemini_err).__name__}: "
-                f"{str(gemini_err)[:120]}). "
-                "Fell back to **Llama 3.2 11B Vision** (Groq) — analysis complete."
+                f"⚠️ Gemini failed after {GEMINI_RETRIES} attempts "
+                f"({gemini_summary[:160]}). "
+                f"Fell back to **{model_label}** — analysis complete."
             )
-        except Exception as groq_err:
-            raise RuntimeError(
-                f"Both vision models failed.\n"
-                f"Gemini: {gemini_err}\n"
-                f"Groq vision: {groq_err}"
-            )
+        except Exception as exc:
+            groq_errors.append(f"{model_label}: {type(exc).__name__}: {str(exc)[:120]}")
+
+    raise RuntimeError(
+        f"All vision models failed. Cannot read the chart.\n\n"
+        f"Gemini errors:\n" + "\n".join(gemini_errors) + "\n\n"
+        f"Groq fallback errors:\n" + "\n".join(groq_errors)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
