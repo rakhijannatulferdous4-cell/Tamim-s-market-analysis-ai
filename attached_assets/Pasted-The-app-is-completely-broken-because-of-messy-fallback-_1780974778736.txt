@@ -1,0 +1,22 @@
+The app is completely broken because of messy fallback logic and missing/incorrect API code. Gemini is hitting a 429 quota block, and all Groq models are failing. 
+
+Please entirely REWRITE the main.py file from scratch to be clean, robust, and bulletproof using these exact rules for 2026:
+
+1. IMPORTS & INITIALIZATION:
+   - At the very top, make sure to add: `import streamlit as st`, `import os`, `import json`, `import re`, `import google.generativeai as genai`, and `from groq import Groq`.
+
+2. STEP 1 (IMAGE VISION FALLBACK):
+   - Wrap the chart image reading in a try-except. 
+   - First, try Gemini vision using `st.secrets["GEMINI_API_KEY"]`. 
+   - If Gemini fails (503 or 429), catch the error and immediately switch to Groq client using `st.secrets["GROQ_API_KEY"]`. For Groq vision, do NOT use decommissioned models. Instead, write code to dynamically fetch the model list from `client.models.list()`, find the first active model ID that contains the word 'vision' (like 'llama-3.2-11b-vision-preview' or newer), and use that to analyze the chart image.
+
+3. TEXT ANALYST MODELS (GROQ):
+   - For the individual AI analyst votes (Analyst 1, 2, and 3), query `client.models.list()` from Groq dynamically to find the top 3 active text models right now (e.g., sort or filter for active 'llama-3.3-70b-versatile', 'qwen', or similar active text models). This avoids 400 model_decommissioned errors completely.
+
+4. RESPONSE CLEANING (THE <THINK> BUG FIX):
+   - Create a clean helper function to parse responses from Groq/Qwen. Inside a try block, use regex: `clean_text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL)`. Then strip out markdown code blocks (```json ... ```) before running `json.loads(clean_text)`. 
+
+5. DEEPSEEK GRACEFUL HANDLE:
+   - Wrap the DeepSeek API call in a try-except. If it returns a 402 error (Payment Required), do NOT crash. Simply display "DeepSeek is currently waiting for a top-up" on the UI and proceed with Gemini and the available Groq models to generate the final debate and trade recommendation box.
+
+Please wipe out the old messy main.py and rewrite it cleanly right now. Restart the Streamlit server when done.
