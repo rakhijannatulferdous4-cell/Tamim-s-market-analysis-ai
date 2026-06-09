@@ -337,23 +337,21 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
             if attempt < RETRIES:
                 time.sleep(DELAY)
 
-    # ── 2. Dynamic Groq vision fallback ──────────────────────────────────────
-    groq_vision_models = _discover_groq_vision_models()
+    # ── 2. Groq vision fallback — hardcoded active model ─────────────────────
+    # llama-3.2-11b-vision-preview is the current active Groq vision model.
+    GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
     groq_errors: list[str] = []
 
-    for model_id, model_label in groq_vision_models:
-        try:
-            data = _groq_vision(image_bytes, mime, extra, model_id, model_label)
-            gemini_summary = " | ".join(gemini_errors)
-            return data, (
-                f"⚠️ Gemini failed ({gemini_summary[:180]}). "
-                f"Auto-detected and used **{model_label}** (Groq) — analysis complete."
-            )
-        except Exception as exc:
-            groq_errors.append(f"{model_label}: {type(exc).__name__}: {str(exc)[:140]}")
-
-    if not groq_vision_models:
-        groq_errors.append("No vision-capable models found in Groq model list.")
+    try:
+        data = _groq_vision(image_bytes, mime, extra,
+                            GROQ_VISION_MODEL, GROQ_VISION_MODEL)
+        gemini_summary = " | ".join(gemini_errors)
+        return data, (
+            f"⚠️ Gemini failed ({gemini_summary[:180]}). "
+            f"Fell back to **{GROQ_VISION_MODEL}** (Groq) — analysis complete."
+        )
+    except Exception as exc:
+        groq_errors.append(f"{GROQ_VISION_MODEL}: {type(exc).__name__}: {str(exc)[:140]}")
 
     # ── 3. Safe text fallback — debate continues regardless ──────────────────
     all_errors = (
