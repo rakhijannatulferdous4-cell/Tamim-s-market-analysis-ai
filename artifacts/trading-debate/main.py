@@ -595,29 +595,183 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI constants & rendering helpers
+# UI constants
 # ─────────────────────────────────────────────────────────────────────────────
 VOTE_COLOR = {"UP": "green", "DOWN": "red", "WAIT": "orange"}
-VOTE_ICON = {"UP": "⬆️", "DOWN": "⬇️", "WAIT": "⏸️"}
+VOTE_ICON  = {"UP": "⬆️",   "DOWN": "⬇️", "WAIT": "⏸️"}
+
+_NEON = {
+    "UP":      "#00ff88",
+    "DOWN":    "#ff3860",
+    "WAIT":    "#ffaa00",
+    "OFFLINE": "#555",
+    "blue":    "#00b4ff",
+    "border":  "#1a2340",
+    "card":    "#0d1220",
+    "bg":      "#080c17",
+}
+
+_PREMIUM_CSS = """
+<style>
+/* ── Base dark theme ──────────────────────────────────────────────── */
+html, body, [data-testid="stAppViewContainer"] {
+    background: #080c17 !important;
+    color: #c8d6e8;
+    font-family: 'Inter', 'Segoe UI', sans-serif;
+}
+[data-testid="stHeader"],
+[data-testid="stToolbar"]        { background: transparent !important; }
+[data-testid="stSidebar"]        { background: #0d1220 !important; }
+[data-testid="stMain"] > div     { padding-top: 1.2rem; }
+
+/* ── Section dividers ─────────────────────────────────────────────── */
+hr { border-color: #1a2340 !important; }
+
+/* ── Metrics ──────────────────────────────────────────────────────── */
+[data-testid="metric-container"] {
+    background: #0d1220;
+    border: 1px solid #1a2340;
+    border-radius: 10px;
+    padding: 10px 14px;
+}
+
+/* ── File uploader ────────────────────────────────────────────────── */
+[data-testid="stFileUploader"] {
+    background: #0d1220;
+    border: 2px dashed #1a3560;
+    border-radius: 12px;
+    padding: 8px;
+}
+[data-testid="stFileUploader"]:hover { border-color: #00b4ff; }
+
+/* ── Text area ────────────────────────────────────────────────────── */
+textarea {
+    background: #0d1220 !important;
+    color: #c8d6e8 !important;
+    border: 1px solid #1a2340 !important;
+    border-radius: 10px !important;
+}
+textarea:focus { border-color: #00b4ff !important; }
+
+/* ── Expanders ────────────────────────────────────────────────────── */
+[data-testid="stExpander"] {
+    background: #0d1220 !important;
+    border: 1px solid #1a2340 !important;
+    border-radius: 12px !important;
+}
+
+/* ── START button — electric-blue pulse ───────────────────────────── */
+[data-testid="baseButton-primary"] {
+    background: linear-gradient(135deg, #0057ff, #00b4ff) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-weight: 700 !important;
+    letter-spacing: .04em !important;
+    animation: btnPulse 2.4s ease-in-out infinite;
+}
+[data-testid="baseButton-primary"]:hover {
+    background: linear-gradient(135deg, #0070ff, #33c6ff) !important;
+    box-shadow: 0 0 22px #00b4ff88 !important;
+    animation: none;
+}
+@keyframes btnPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(0,180,255,.55); }
+    50%       { box-shadow: 0 0 0 14px rgba(0,180,255,0); }
+}
+
+/* ── Analyst / info cards — fade-in ──────────────────────────────── */
+@keyframes fadeUp {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.ai-card {
+    background: #0d1220;
+    border: 1px solid #1a2340;
+    border-radius: 14px;
+    padding: 18px 20px 14px;
+    margin: 10px 0;
+    animation: fadeUp .55s ease both;
+    box-shadow: 0 4px 24px rgba(0,0,0,.45);
+}
+.ai-card:hover { border-color: #00b4ff55; box-shadow: 0 4px 28px rgba(0,180,255,.15); }
+.ai-card.offline { border-color: #ff386040; opacity: .75; }
+
+.card-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+.model-lbl { font-size:.95rem; font-weight:700; color:#e0eaf8; }
+.vote-pill {
+    font-size:.8rem; font-weight:800; padding:3px 11px;
+    border-radius:20px; border: 1.5px solid; letter-spacing:.05em;
+}
+.conf-lbl  { font-size:.78rem; color:#6a82a0; margin-left:auto; }
+
+.analysis-txt { font-size:.88rem; color:#a8bcd4; line-height:1.6; margin:6px 0; }
+.risks-row    { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 4px; }
+.risk-tag {
+    font-size:.74rem; padding:3px 9px; border-radius:6px;
+    background:#12192e; border:1px solid #1e2f50; color:#7a9abf;
+}
+.reasoning-txt { font-size:.83rem; color:#5e7a9a; font-style:italic; margin-top:6px; }
+.err-txt  { font-size:.82rem; color:#ff6080; margin-top:6px; }
+
+/* ── Scoreboard tiles ─────────────────────────────────────────────── */
+.sb-tile {
+    background: #0d1220;
+    border: 1.5px solid #1a2340;
+    border-radius: 10px;
+    padding: 10px 6px;
+    text-align: center;
+    animation: fadeUp .5s ease both;
+}
+.sb-tile:hover { border-color: #00b4ff55; }
+.sb-model-lbl { font-size:.65rem; color:#566880; margin-bottom:4px; }
+.sb-vote-icon { font-size:1.4rem; }
+.sb-vote-txt  { font-size:.88rem; font-weight:800; }
+.sb-conf-txt  { font-size:.65rem; color:#566880; margin-top:2px; }
+
+/* ── Final verdict banner ─────────────────────────────────────────── */
+.verdict-banner {
+    text-align: center;
+    padding: 28px 0 12px;
+    animation: fadeUp .6s ease both;
+}
+.verdict-word { font-size: 4.8rem; font-weight: 900; line-height: 1; }
+.verdict-sub  { font-size: 1rem; color: #6a82a0; margin-top: 6px; }
+
+/* ── Trade recommendation boxes ───────────────────────────────────── */
+.trade-box {
+    border-radius: 16px;
+    padding: 32px 28px;
+    margin: 10px 0;
+    text-align: center;
+    animation: fadeUp .6s ease both;
+}
+.trade-arrow { font-size: 2.6rem; }
+.trade-txt {
+    font-size: 1.45rem; font-weight: 900;
+    letter-spacing: .025em; line-height: 1.55; margin-top: 10px;
+}
+
+/* ── Step headers ─────────────────────────────────────────────────── */
+.step-header {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 1.25rem; font-weight: 700; color: #c8d6e8;
+    border-left: 3px solid #00b4ff;
+    padding-left: 12px; margin: 28px 0 12px;
+}
+</style>
+"""
 
 
 def _model_icon(model_name: str) -> str:
-    """Return an emoji for any model name based on keyword matching."""
     n = model_name.lower()
-    if "gemini" in n:
-        return "✨"
-    if "deepseek" in n:
-        return "🔭"
-    if "mixtral" in n:
-        return "⚗️"
-    if "gemma" in n:
-        return "💎"
-    if "qwen" in n:
-        return "🧠"
-    if "vision" in n:
-        return "👁️"
-    if "llama" in n:
-        return "🦙"
+    if "gemini"   in n: return "✨"
+    if "deepseek" in n: return "🔭"
+    if "mixtral"  in n: return "⚗️"
+    if "gemma"    in n: return "💎"
+    if "qwen"     in n: return "🧠"
+    if "vision"   in n: return "👁️"
+    if "llama"    in n: return "🦙"
     return "🤖"
 
 
@@ -627,43 +781,49 @@ def badge(vote: str) -> str:
     return f":{c}[**{i} {vote}**]"
 
 
+def _vote_pill_html(vote: str, confidence: int = 0) -> str:
+    color = _NEON.get(vote, "#888")
+    icon  = VOTE_ICON.get(vote, "❓")
+    conf  = f"<span class='conf-lbl'>{confidence}% conf</span>" if confidence else ""
+    return (
+        f"<span class='vote-pill' style='color:{color};border-color:{color};'>"
+        f"{icon} {vote}</span>{conf}"
+    )
+
+
 def render_chart_analysis(g: dict, status_msg: str):
     vision = g.get("vision_model", "Vision Model")
-    icon = _model_icon(vision)
-    if any(w in status_msg.lower() for w in ("fallback", "unavailable", "failed")):
+    icon   = _model_icon(vision)
+
+    if any(w in status_msg.lower() for w in ("fallback", "unavailable", "failed", "offline")):
         st.warning(status_msg)
     else:
         st.success(status_msg)
 
     with st.expander(f"{icon} {vision} — Chart Analysis + Market News", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Asset", g.get("asset", "—"))
+        c1.metric("Asset",     g.get("asset", "—"))
         c2.metric("Timeframe", g.get("timeframe", "—"))
-        c3.metric("Trend", g.get("trend", "—"))
+        c3.metric("Trend",     g.get("trend", "—"))
         v = g.get("gemini_vote", "WAIT")
-        c4.metric(
-            "Vision Vote",
-            f"{VOTE_ICON.get(v, '')} {v}",
-            f"{g.get('gemini_confidence', 0)}% confidence",
-        )
+        c4.metric("Vision Vote",
+                  f"{VOTE_ICON.get(v,'')} {v}",
+                  f"{g.get('gemini_confidence', 0)}% confidence")
 
-        st.info(f"**Technical Summary:** {g.get('technical_summary', '')}")
+        st.info(f"**Technical Summary:** {g.get('technical_summary','')}")
 
         ca, cb = st.columns(2)
         with ca:
             st.markdown("**Support**")
-            for s in g.get("support", []):
-                st.markdown(f"- `{s}`")
+            for s in g.get("support", []): st.markdown(f"- `{s}`")
         with cb:
             st.markdown("**Resistance**")
-            for r in g.get("resistance", []):
-                st.markdown(f"- `{r}`")
+            for r in g.get("resistance", []): st.markdown(f"- `{r}`")
 
         inds = g.get("indicators", {})
         if inds:
             st.markdown("**Indicators**")
-            for k, val in inds.items():
-                st.markdown(f"- **{k}**: {val}")
+            for k, val in inds.items(): st.markdown(f"- **{k}**: {val}")
 
         if g.get("patterns"):
             st.markdown("**Patterns:** " + " · ".join(f"`{p}`" for p in g["patterns"]))
@@ -672,72 +832,88 @@ def render_chart_analysis(g: dict, status_msg: str):
         st.markdown("**📰 Market News**")
         for item in g.get("live_news", []):
             sent = item.get("sentiment", "Neutral")
-            dot = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
-            st.markdown(
-                f"{dot} **{item.get('headline', '')}**  \n*{item.get('source', '')}*"
-            )
-        st.markdown(f"**News Summary:** {g.get('news_summary', '')}")
-        st.markdown(f"💬 *{g.get('gemini_reasoning', '')}*")
+            dot  = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
+            st.markdown(f"{dot} **{item.get('headline','')}**  \n*{item.get('source','')}*")
+        st.markdown(f"**News Summary:** {g.get('news_summary','')}")
+        st.markdown(f"💬 *{g.get('gemini_reasoning','')}*")
 
 
 def render_vote_card(v: dict, status: str = "online"):
-    model = v.get("model", "Unknown")
-    vote = v.get("vote", "WAIT")
-    icon = _model_icon(model)
+    model    = v.get("model", "Unknown")
+    vote     = v.get("vote", "WAIT")
+    icon     = _model_icon(model)
+    conf     = v.get("confidence", 0)
+    analysis = v.get("analysis", "")
+    risks    = v.get("key_risks", [])
+    reason   = v.get("reasoning", "")
 
     if status == "offline":
-        with st.expander(f"🔴 **{model}** — OFFLINE / SKIPPED", expanded=False):
-            st.error(v.get("error_msg", "This model did not respond."))
+        err = str(v.get("error_msg", "This model did not respond."))[:220]
+        st.markdown(
+            f"<div class='ai-card offline'>"
+            f"<div class='card-row'>"
+            f"<span class='model-lbl'>🔴 {icon} {model} — OFFLINE / SKIPPED</span>"
+            f"</div>"
+            f"<p class='err-txt'>{err}</p>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
         return
 
-    with st.expander(
-        f"{icon} **{model}** — {badge(vote)} — {v.get('confidence', 0)}% confidence",
-        expanded=True,
-    ):
-        st.markdown(f"**Analysis:** {v.get('analysis', '')}")
-        risks = v.get("key_risks", [])
-        if risks:
-            st.markdown("**Key Risks:** " + " · ".join(f"`{r}`" for r in risks))
-        st.markdown(f"💬 *{v.get('reasoning', '')}*")
+    color      = _NEON.get(vote, "#888")
+    vote_icon  = VOTE_ICON.get(vote, "❓")
+    risks_html = "".join(f"<span class='risk-tag'>{r}</span>" for r in risks)
+
+    st.markdown(
+        f"<div class='ai-card'>"
+        f"<div class='card-row'>"
+        f"<span class='model-lbl'>{icon} {model}</span>"
+        f"<span class='vote-pill' style='color:{color};border-color:{color};'>"
+        f"{vote_icon} {vote}</span>"
+        f"<span class='conf-lbl'>{conf}% confidence</span>"
+        f"</div>"
+        f"<p class='analysis-txt'>{analysis}</p>"
+        f"<div class='risks-row'>{risks_html}</div>"
+        f"<p class='reasoning-txt'>💬 {reason}</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_scoreboard(chart_data: dict, analyst_votes: list[dict], offline: list[str]):
-    st.markdown("### 🗳️ All AI Votes at a Glance")
-    vision_name = chart_data.get("vision_model", "Vision")
-    online_entries = [
-        {
-            "model": vision_name,
-            "vote": chart_data.get("gemini_vote", "WAIT"),
-            "conf": chart_data.get("gemini_confidence", 0),
-            "icon": _model_icon(vision_name),
-        }
-    ] + [
-        {
-            "model": v.get("model", "?"),
-            "vote": v.get("vote", "WAIT"),
-            "conf": v.get("confidence", 0),
-            "icon": _model_icon(v.get("model", "")),
-        }
-        for v in analyst_votes
-    ]
+    st.markdown("<div class='step-header'>🗳️ All AI Votes at a Glance</div>",
+                unsafe_allow_html=True)
+
+    vision_name   = chart_data.get("vision_model", "Vision")
+    online_entries = [{
+        "model": vision_name,
+        "vote":  chart_data.get("gemini_vote", "WAIT"),
+        "conf":  chart_data.get("gemini_confidence", 0),
+        "icon":  _model_icon(vision_name),
+    }] + [{
+        "model": v.get("model", "?"),
+        "vote":  v.get("vote", "WAIT"),
+        "conf":  v.get("confidence", 0),
+        "icon":  _model_icon(v.get("model", "")),
+    } for v in analyst_votes]
+
     all_entries = online_entries + [
-        {"model": name, "vote": "OFFLINE", "conf": 0, "icon": "🔴"} for name in offline
+        {"model": name, "vote": "OFFLINE", "conf": 0, "icon": "🔴"}
+        for name in offline
     ]
 
     cols = st.columns(max(len(all_entries), 1))
     for col, entry in zip(cols, all_entries):
-        vote = entry["vote"]
-        color = VOTE_COLOR.get(vote, "#888") if vote != "OFFLINE" else "#888"
-        icon = VOTE_ICON.get(vote, "❌") if vote != "OFFLINE" else "❌"
+        vote  = entry["vote"]
+        color = _NEON.get(vote, "#555")
+        icon  = VOTE_ICON.get(vote, "❌") if vote != "OFFLINE" else "❌"
+        conf_txt = "offline" if vote == "OFFLINE" else f"{entry['conf']}% conf"
         col.markdown(
-            f"<div style='text-align:center;padding:10px 4px;"
-            f"border:1px solid #444;border-radius:8px;'>"
-            f"<div style='font-size:0.7rem;color:#aaa;margin-bottom:2px;'>"
-            f"{entry['icon']} {entry['model']}</div>"
-            f"<div style='font-size:1.5rem;'>{icon}</div>"
-            f"<div style='font-size:.95rem;font-weight:800;color:{color};'>{vote}</div>"
-            f"<div style='font-size:0.7rem;color:#aaa;'>"
-            f"{'offline' if vote == 'OFFLINE' else str(entry['conf']) + '% conf'}</div>"
+            f"<div class='sb-tile' style='border-color:{color}22;'>"
+            f"<div class='sb-model-lbl'>{entry['icon']} {entry['model']}</div>"
+            f"<div class='sb-vote-icon'>{icon}</div>"
+            f"<div class='sb-vote-txt' style='color:{color};'>{vote}</div>"
+            f"<div class='sb-conf-txt'>{conf_txt}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -745,30 +921,37 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict], offline: list
 
 def render_final_decision(synth: dict):
     decision = synth.get("FINAL_DECISION", "WAIT")
-    color = VOTE_COLOR.get(decision, "gray")
-    arrow = VOTE_ICON.get(decision, "❓")
+    color    = _NEON.get(decision, "#888")
+    arrow    = VOTE_ICON.get(decision, "❓")
     strength = synth.get("consensus_strength", "")
-    tally = synth.get("vote_tally", {})
-    conf = synth.get("confidence", 0)
-    s_model = synth.get("_synth_model", "Gemini")
+    tally    = synth.get("vote_tally", {})
+    conf     = synth.get("confidence", 0)
+    s_model  = synth.get("_synth_model", "Gemini")
 
     st.markdown("---")
-    st.markdown(f"## 🏆 Final Consensus  *(moderated by {s_model})*")
     st.markdown(
-        f"<div style='text-align:center;padding:18px 0 4px;'>"
-        f"<span style='font-size:4.5rem;font-weight:900;color:{color};'>"
-        f"{arrow} {decision}</span></div>"
-        f"<p style='text-align:center;font-size:1.05rem;margin-top:0;'>"
-        f"Consensus: <strong>{strength}</strong> &nbsp;|&nbsp; "
-        f"Confidence: <strong>{conf}%</strong></p>",
+        f"<div class='step-header'>🏆 Final Consensus"
+        f"<span style='font-size:.8rem;font-weight:400;color:#566880;margin-left:8px;'>"
+        f"moderated by {s_model}</span></div>",
         unsafe_allow_html=True,
     )
+    st.markdown(
+        f"<div class='verdict-banner'>"
+        f"<div class='verdict-word' style='color:{color};'>{arrow} {decision}</div>"
+        f"<div class='verdict-sub'>"
+        f"Consensus: <strong style='color:#c8d6e8;'>{strength}</strong>"
+        f" &nbsp;·&nbsp; Confidence: <strong style='color:{color};'>{conf}%</strong>"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("⬆️ UP", tally.get("UP", 0))
+    c1.metric("⬆️ UP",   tally.get("UP",   0))
     c2.metric("⬇️ DOWN", tally.get("DOWN", 0))
     c3.metric("⏸️ WAIT", tally.get("WAIT", 0))
-    st.markdown(f"**Cross-Examination:** {synth.get('cross_examination', '')}")
-    st.info(f"📋 **Moderator Note:** {synth.get('moderator_note', '')}")
+
+    st.markdown(f"**Cross-Examination:** {synth.get('cross_examination','')}")
+    st.info(f"📋 **Moderator Note:** {synth.get('moderator_note','')}")
 
 
 def render_trade_recommendation(synth: dict):
@@ -778,41 +961,38 @@ def render_trade_recommendation(synth: dict):
 
     should_trade = ra.get("should_trade", False)
     display_text = ra.get("display_text", "")
-    direction = ra.get("trade_direction") or ""
-    candles = ra.get("candle_count")
-    total_mins = ra.get("total_duration_minutes")
+    direction    = ra.get("trade_direction") or ""
+    candles      = ra.get("candle_count")
+    total_mins   = ra.get("total_duration_minutes")
     no_trade_rsn = ra.get("dont_trade_reason") or ""
 
     st.markdown("---")
-    st.markdown("## 🎯 Recommended Action")
+    st.markdown("<div class='step-header'>🎯 Recommended Action</div>",
+                unsafe_allow_html=True)
 
     if should_trade and direction in ("UP", "DOWN"):
-        bg = "#062e0f" if direction == "UP" else "#2e0606"
-        txt = "#00e676" if direction == "UP" else "#ff5252"
-        border = "#00c853" if direction == "UP" else "#d50000"
-        arrow = "⬆️" if direction == "UP" else "⬇️"
+        bg     = "#041a0a" if direction == "UP" else "#1a0408"
+        txt    = _NEON["UP"]   if direction == "UP" else _NEON["DOWN"]
+        border = "#00c853"     if direction == "UP" else "#d50000"
+        arrow  = "⬆️"         if direction == "UP" else "⬇️"
         st.markdown(
-            f"<div style='background:{bg};border:3px solid {border};"
-            f"border-radius:14px;padding:30px 24px;margin:10px 0;text-align:center;'>"
-            f"<div style='font-size:2.4rem;'>{arrow}</div>"
-            f"<div style='color:{txt};font-size:1.5rem;font-weight:900;"
-            f"letter-spacing:.02em;line-height:1.55;margin-top:8px;'>"
-            f"{display_text}</div></div>",
+            f"<div class='trade-box' style='background:{bg};border:2.5px solid {border};'>"
+            f"<div class='trade-arrow'>{arrow}</div>"
+            f"<div class='trade-txt' style='color:{txt};'>{display_text}</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
         if candles and total_mins:
             m1, m2, m3 = st.columns(3)
-            m1.metric("Direction", f"{arrow} {direction}")
+            m1.metric("Direction",       f"{arrow} {direction}")
             m2.metric("Candles to Hold", str(candles))
-            m3.metric("Est. Duration", f"{total_mins} min")
+            m3.metric("Est. Duration",   f"{total_mins} min")
     else:
         st.markdown(
-            f"<div style='background:#2b1e00;border:3px solid #ff8f00;"
-            f"border-radius:14px;padding:30px 24px;margin:10px 0;text-align:center;'>"
-            f"<div style='font-size:2.4rem;'>🚫</div>"
-            f"<div style='color:#ffd740;font-size:1.5rem;font-weight:900;"
-            f"letter-spacing:.02em;line-height:1.55;margin-top:8px;'>"
-            f"{display_text}</div></div>",
+            f"<div class='trade-box' style='background:#1a1200;border:2.5px solid #ff8f00;'>"
+            f"<div class='trade-arrow'>🚫</div>"
+            f"<div class='trade-txt' style='color:#ffd740;'>{display_text}</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
         if no_trade_rsn and no_trade_rsn.lower() not in ("null", "none", ""):
@@ -822,31 +1002,46 @@ def render_trade_recommendation(synth: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main UI
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("📊 AI Trading Debate")
-st.caption(
-    "Crash-proof · 5 live AI models · auto-fallback on any outage · "
-    "candle-based trade target"
+
+# Inject global CSS first
+st.markdown(_PREMIUM_CSS, unsafe_allow_html=True)
+
+# Hero header
+st.markdown(
+    "<h1 style='font-size:2.1rem;font-weight:900;letter-spacing:.01em;"
+    "background:linear-gradient(90deg,#00b4ff,#00ff88);-webkit-background-clip:text;"
+    "-webkit-text-fill-color:transparent;margin-bottom:0;'>📊 AI Trading Debate</h1>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<p style='color:#566880;font-size:.88rem;margin-top:4px;'>"
+    "Crash-proof &nbsp;·&nbsp; 5 live AI models &nbsp;·&nbsp; "
+    "auto-fallback on any outage &nbsp;·&nbsp; candle-based trade target</p>",
+    unsafe_allow_html=True,
 )
 
-st.markdown("### 1️⃣  Upload Chart")
+st.markdown("<div class='step-header'>1️⃣ Upload Chart</div>", unsafe_allow_html=True)
 uploaded = st.file_uploader(
     "Upload Image",
     type=["png", "jpg", "jpeg", "webp"],
+    label_visibility="collapsed",
     help="Screenshot of any trading chart",
 )
 if uploaded:
     st.image(Image.open(uploaded), caption="Uploaded chart", use_container_width=True)
 
-st.markdown("### 2️⃣  Extra Context *(optional)*")
+st.markdown("<div class='step-header'>2️⃣ Extra Context <span style='font-weight:400;font-size:.8rem;color:#566880;'>(optional)</span></div>",
+            unsafe_allow_html=True)
 extra_ctx = st.text_area(
-    "Any context for the AIs",
+    "context",
+    label_visibility="collapsed",
     placeholder="e.g. BTC/USDT 10-min chart, NY session open…",
     height=70,
 )
 
-st.markdown("### 3️⃣  Start")
+st.markdown("<div class='step-header'>3️⃣ Start the Debate</div>", unsafe_allow_html=True)
 run = st.button(
-    "🚀 START AI DEBATE",
+    "🚀  START AI DEBATE",
     disabled=(uploaded is None),
     use_container_width=True,
     type="primary",
@@ -855,16 +1050,12 @@ run = st.button(
 if not run:
     st.stop()
 
-# Read uploaded image
+# Read uploaded image bytes
 uploaded.seek(0)
 image_bytes = uploaded.read()
-ext = uploaded.name.rsplit(".", 1)[-1].lower()
-mime_map = {
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "png": "image/png",
-    "webp": "image/webp",
-}
+ext       = uploaded.name.rsplit(".", 1)[-1].lower()
+mime_map  = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+             "png": "image/png",  "webp": "image/webp"}
 mime_type = mime_map.get(ext, "image/jpeg")
 
 st.markdown("---")
@@ -872,8 +1063,9 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Chart vision
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown("## Step 1 — Chart Analysis & Market News")
-with st.spinner("Reading chart… (Gemini primary, auto-fallback to Groq vision)"):
+st.markdown("<div class='step-header'>Step 1 — Chart Analysis & Market News</div>",
+            unsafe_allow_html=True)
+with st.spinner("🔍 Reading chart… Gemini primary, Groq auto-fallback…"):
     chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
 
 render_chart_analysis(chart_data, vision_status)
@@ -882,44 +1074,40 @@ render_chart_analysis(chart_data, vision_status)
 # STEP 2 — Independent analyst votes
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
-st.markdown("## Step 2 — Independent Analyst Votes")
+st.markdown("<div class='step-header'>Step 2 — Independent Analyst Votes</div>",
+            unsafe_allow_html=True)
 
-with st.spinner("🔍 Discovering active Groq text models…"):
+with st.spinner("⚡ Discovering active Groq text models…"):
     _groq_text_models = _discover_groq_text_models(n=3)
 
 _groq_labels = ", ".join(_short_label(mid) for mid, _ in _groq_text_models)
-st.caption(f"🤖 Auto-selected Groq analysts: **{_groq_labels}**")
+st.markdown(
+    f"<p style='font-size:.8rem;color:#566880;margin-bottom:12px;'>"
+    f"🤖 Auto-selected: <strong style='color:#a0b8d0;'>{_groq_labels}</strong></p>",
+    unsafe_allow_html=True,
+)
 
 ANALYST_MODELS: list[tuple[str, str | None, str]] = [
     ("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models
-] + [
-    ("deepseek", None, "DeepSeek-Chat"),
-]
+] + [("deepseek", None, "DeepSeek-Chat")]
 
-analyst_votes: list[dict] = []
-offline_models: list[str] = []
+analyst_votes:  list[dict] = []
+offline_models: list[str]  = []
 
 for backend, model_id, model_name in ANALYST_MODELS:
     with st.spinner(f"{_model_icon(model_name)} {model_name} is analysing…"):
         try:
-            if backend == "groq":
-                result = _call_groq(model_id, model_name, chart_data)
-            else:
-                result = _call_deepseek(chart_data)
+            result = (_call_groq(model_id, model_name, chart_data)
+                      if backend == "groq" else _call_deepseek(chart_data))
             analyst_votes.append(result)
             render_vote_card(result, status="online")
         except Exception as exc:
             err_msg = str(exc)
-            st.warning(f"🔴 **{model_name} skipped** — {err_msg[:200]}")
             offline_models.append(model_name)
-            render_vote_card(
-                {"model": model_name, "error_msg": err_msg}, status="offline"
-            )
+            render_vote_card({"model": model_name, "error_msg": err_msg}, status="offline")
 
 if len(analyst_votes) == 0:
-    st.error(
-        "All analyst models are currently offline. Please try again in a few minutes."
-    )
+    st.error("All analyst models are currently offline. Please try again in a few minutes.")
     st.stop()
 
 render_scoreboard(chart_data, analyst_votes, offline_models)
@@ -928,16 +1116,22 @@ render_scoreboard(chart_data, analyst_votes, offline_models)
 # STEP 3 — Cross-examination & final verdict
 # ══════════════════════════════════════════════════════════════════════════════
 n_online = 1 + len(analyst_votes)
-n_total = 1 + len(ANALYST_MODELS)
+n_total  = 1 + len(ANALYST_MODELS)
 st.markdown("---")
 st.markdown(
-    f"## Step 3 — Cross-Examination & Final Verdict  "
-    f"*({n_online}/{n_total} models online)*"
+    f"<div class='step-header'>Step 3 — Cross-Examination & Final Verdict"
+    f"<span style='font-size:.8rem;font-weight:400;color:#566880;margin-left:8px;'>"
+    f"{n_online}/{n_total} models online</span></div>",
+    unsafe_allow_html=True,
 )
 if offline_models:
-    st.caption(f"🔴 Offline this run: {', '.join(offline_models)}")
+    st.markdown(
+        f"<p style='font-size:.78rem;color:#566880;'>🔴 Offline: "
+        f"{', '.join(offline_models)}</p>",
+        unsafe_allow_html=True,
+    )
 
-with st.spinner("Cross-examining all opinions and computing final verdict…"):
+with st.spinner("🧠 Cross-examining all opinions and computing final verdict…"):
     try:
         synthesis = step3_synthesize(chart_data, analyst_votes)
     except Exception as exc:
