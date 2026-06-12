@@ -261,7 +261,7 @@ def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
     # Try with Google Search grounding first; fall back to plain if that errors
     try:
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-1.5-flash",
             contents=contents,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
@@ -269,11 +269,11 @@ def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
         )
     except Exception:
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-1.5-flash",
             contents=contents,
         )
     result = parse_json(resp.text)
-    result["vision_model"] = "Gemini 2.5 Flash"
+    result["vision_model"] = "Gemini 1.5 Flash"
     return result
 
 
@@ -326,34 +326,24 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 
     Strategy
     ────────
-    1. Gemini 2.5 Flash — up to 3 attempts, 3-second pause between retries.
-       Handles 429 RESOURCE_EXHAUSTED and 503 demand spikes.
-    2. Dynamic Groq vision — queries client.models.list() at runtime, picks
-       every model whose ID contains 'vision', tries each until one succeeds.
-       No hardcoded model names — works in 2027 and beyond.
-    3. Text fallback — if ALL vision APIs fail, returns a safe context string
-       ("highly volatile market, strict risk management") so the debate
-       (Steps 2–3) can still run and produce a FINAL_DECISION.
+    1. Gemini 1.5 Flash — single attempt; on ANY error (429, 503, quota, etc.)
+       immediately fall through to Groq.  Gemini stays in the committee
+       scoreboard as "Temporarily Offline" so users know it was attempted.
+    2. Groq vision — hardcoded llama-3.2-11b-vision-preview (active 2026 model).
+       Image bytes are base64-encoded and passed as a data-URI — correct format.
+    3. Text fallback — if both vision APIs fail the debate still runs with a
+       "highly volatile / strict risk management" context.
     """
-    RETRIES = 3
-    DELAY = 3
-
-    # ── 1. Gemini with retries ────────────────────────────────────────────────
-    gemini_errors: list[str] = []
-    for attempt in range(1, RETRIES + 1):
-        try:
-            data = _gemini_vision(image_bytes, mime, extra)
-            suffix = f" (attempt {attempt}/{RETRIES})" if attempt > 1 else ""
-            return data, f"✨ Gemini 2.5 Flash — chart analysis complete{suffix}."
-        except Exception as exc:
-            gemini_errors.append(
-                f"Attempt {attempt}: {type(exc).__name__}: {str(exc)[:140]}"
-            )
-            if attempt < RETRIES:
-                time.sleep(DELAY)
+    # ── 1. Gemini — one shot, immediate fallback on any error ─────────────────
+    gemini_error = ""
+    try:
+        data = _gemini_vision(image_bytes, mime, extra)
+        return data, "✨ Gemini 1.5 Flash — chart analysis complete."
+    except Exception as exc:
+        gemini_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
     # ── 2. Groq vision fallback — hardcoded active model ─────────────────────
-    # llama-3.2-11b-vision-preview is the current active Groq vision model.
+    # llama-3.2-11b-vision-preview accepts base64 image_url data-URIs.
     GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
     groq_errors: list[str] = []
 
@@ -361,9 +351,13 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
         data = _groq_vision(
             image_bytes, mime, extra, GROQ_VISION_MODEL, GROQ_VISION_MODEL
         )
-        gemini_summary = " | ".join(gemini_errors)
+        # Keep Gemini visible in the committee as "Temporarily Offline"
+        data.setdefault("gemini_vote",       "Offline")
+        data.setdefault("gemini_confidence", 0)
+        data.setdefault("gemini_reasoning",
+                        f"Gemini temporarily offline — {gemini_error[:120]}")
         return data, (
-            f"⚠️ Gemini failed ({gemini_summary[:180]}). "
+            f"⚠️ Gemini 1.5 Flash offline ({gemini_error[:180]}). "
             f"Fell back to **{GROQ_VISION_MODEL}** (Groq) — analysis complete."
         )
     except Exception as exc:
@@ -373,7 +367,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 
     # ── 3. Safe text fallback — debate continues regardless ──────────────────
     all_errors = (
-        "Gemini: " + " | ".join(gemini_errors) + " || Groq: " + " | ".join(groq_errors)
+        "Gemini: " + gemini_error + " || Groq: " + " | ".join(groq_errors)
     )
     status = (
         "🚨 **All vision APIs failed** — running in text-fallback mode.\n\n"
