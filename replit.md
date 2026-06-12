@@ -1,45 +1,88 @@
-# [Project name]
+import streamlit as st
+import os
+import json
+import re
+import base64
+import google.generativeai as genai
+from groq import Groq
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+# Page Config
+st.set_page_config(page_title="AI Trading Committee", layout="wide")
+st.title("📈 AI Trading Committee — Live Debate")
 
-## Run & Operate
+# API Keys Initialization
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", "")
+GROQ_KEY = st.secrets.get("GROQ_API_KEY", "")
+DEEPSEEK_KEY = st.secrets.get("DEEPSEEK_API_KEY", "")
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+# Clean reasoning tokens like <think>...</think> from Qwen/DeepSeek R1
+def clean_json_response(text):
+    try:
+        # Strip thinking process
+        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # Strip markdown json blocks
+        cleaned = re.sub(r'```json\s*|\s*```', '', cleaned).strip()
+        return json.loads(cleaned)
+    except Exception as e:
+        try:
+            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        except:
+            pass
+        raise ValueError(f"Failed to parse JSON response. Raw output: {text[:200]}")
 
-## Stack
+# Helper to encode image for Groq Vision
+def encode_image_base64(image_bytes):
+    return base64.b64encode(image_bytes).decode('utf-8')
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+# File Uploader
+uploaded_file = st.file_uploader("Upload Market Chart Screenshot", type=["jpg", "jpeg", "png"])
 
-## Where things live
+if uploaded_file and st.button("START AI DEBATE"):
+    image_bytes = uploaded_file.read()
+    chart_context = ""
+    vision_success = False
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+    st.subheader("Step 1 — Chart Analysis & Market News")
 
-## Architecture decisions
+    # 1. TRY GEMINI VISION FIRST
+    if GEMINI_KEY:
+        try:
+            with st.spinner("Analyzing chart with Gemini..."):
+                genai.configure(api_key=GEMINI_KEY)
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                response = model.generate_content([
+                    "Analyze this trading chart. Identify key support, resistance, current trend, indicators (RSI/MACD if visible), and output a structured analysis text.",
+                    {"mime_type": "image/jpeg", "data": image_bytes}
+                ])
+                chart_context = response.text
+                vision_success = True
+                st.success("✅ Chart successfully analyzed by Gemini!")
+        except Exception as e:
+            st.warning(f"⚠️ Gemini Vision failed (Quota/Server Issue): {str(e)}")
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+    # 2. FALLBACK TO GROQ VISION IF GEMINI FAILS
+    if not vision_success and GROQ_KEY:
+        try:
+            with st.spinner("Gemini busy. Falling back to Groq Llama-Vision..."):
+                groq_client = Groq(api_key=GROQ_KEY)
+                base64_image = encode_image_base64(image_bytes)
 
-## Product
-
-_Describe the high-level user-facing capabilities of this app once they exist._
-
-## User preferences
-
-_Populate as you build — explicit user instructions worth remembering across sessions._
-
-## Gotchas
-
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+                response = groq_client.chat.completions.create(
+                    model="llama-3.2-11b-vision-preview",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Analyze this trading chart layout. Extract asset trend, immediate support/resistance levels, and overall structure."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                            ]
+                        }
+                    ]
+                )
+                chart_context = response.choices[0].message.content
+                vision_success = True
+                st.success("✅ Chart successfully analyzed by Groq Llama-Vision!")
+        except Exception as e:
+            st.error(f"❌ Groq

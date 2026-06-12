@@ -4,7 +4,7 @@ AI Trading Debate — clean, future-proof, crash-proof.
 Pipeline
 ────────
 Step 1  Chart Vision  : Gemini 2.5 Flash (3 retries)
-                        → auto-detected Groq vision model (dynamic)
+                        → llama-3.2-11b-vision-preview (Groq, hardcoded)
                         → text-fallback if all vision APIs fail
 Step 2  Analyst Votes : Top-3 Groq text models (auto-selected live)
                         + DeepSeek-Chat (skipped gracefully on 402)
@@ -12,9 +12,6 @@ Step 3  Final Verdict : Gemini synthesis → Groq fallback
                         → FINAL_DECISION + candle recommendation box
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Imports
-# ─────────────────────────────────────────────────────────────────────────────
 import base64
 import json
 import os
@@ -64,23 +61,12 @@ def require_secret(key: str) -> str:
 # JSON parser — handles <think> tokens, markdown fences, and bare JSON
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_json(text: str) -> dict:
-    """
-    Robustly extract a JSON object from any model response.
-
-    Handles:
-    - <think>…</think> reasoning tokens (Qwen3, DeepSeek-R1, etc.)
-    - ```json … ``` and ``` … ``` markdown code fences
-    - Bare JSON with optional surrounding whitespace
-    """
     raw = text or ""
-    # 1. Strip reasoning tokens — must use re.DOTALL so newlines are matched
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    # 2. Strip markdown code fences
     if "```json" in raw:
         raw = raw.split("```json", 1)[1].split("```", 1)[0]
     elif "```" in raw:
         raw = raw.split("```", 1)[1].split("```", 1)[0]
-    # 3. Extract the JSON object
     start = raw.find("{")
     end   = raw.rfind("}") + 1
     if start < 0:
@@ -89,7 +75,7 @@ def parse_json(text: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Groq dynamic model discovery
+# Groq model pools
 # ─────────────────────────────────────────────────────────────────────────────
 _GROQ_TEXT_EXCLUDE = frozenset(
     ["vision", "whisper", "guard", "embed", "tts", "distil"]
@@ -110,13 +96,10 @@ def _discover_groq_vision_models() -> list[tuple[str, str]]:
     """
     try:
         from groq import Groq
-        client  = Groq(api_key=require_secret("GROQ_API_KEY"))
+
+        client = Groq(api_key=require_secret("GROQ_API_KEY"))
         listing = client.models.list()
-        return [
-            (m.id, m.id)
-            for m in listing.data
-            if "vision" in m.id.lower()
-        ]
+        return [(m.id, m.id) for m in listing.data if "vision" in m.id.lower()]
     except Exception:
         return []
 
@@ -131,7 +114,8 @@ def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
     """
     try:
         from groq import Groq
-        client  = Groq(api_key=require_secret("GROQ_API_KEY"))
+
+        client = Groq(api_key=require_secret("GROQ_API_KEY"))
         listing = client.models.list()
 
         candidates: list[tuple[int, str]] = []
@@ -141,19 +125,31 @@ def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
                 continue
             # Score by family (higher = newer / more capable)
             score = 0
-            if   "llama-3.3" in mid: score += 100
-            elif "qwen"       in mid: score += 90   # Qwen3 32B is top-tier
-            elif "llama-3.2"  in mid: score += 80
-            elif "llama-3.1"  in mid: score += 70
-            elif "llama-3"    in mid: score += 60
-            elif "mixtral"    in mid: score += 55
-            elif "gemma"      in mid: score += 50
-            else:                     score += 10
+            if "llama-3.3" in mid:
+                score += 100
+            elif "qwen" in mid:
+                score += 90  # Qwen3 32B is top-tier
+            elif "llama-3.2" in mid:
+                score += 80
+            elif "llama-3.1" in mid:
+                score += 70
+            elif "llama-3" in mid:
+                score += 60
+            elif "mixtral" in mid:
+                score += 55
+            elif "gemma" in mid:
+                score += 50
+            else:
+                score += 10
             # Bonus for larger parameter counts
-            if   any(x in mid for x in ["70b", "72b", "32b"]): score += 30
-            elif any(x in mid for x in ["34b", "13b"]):         score += 20
-            elif "8b" in mid:                                    score += 15
-            elif "7b" in mid:                                    score += 12
+            if any(x in mid for x in ["70b", "72b", "32b"]):
+                score += 30
+            elif any(x in mid for x in ["34b", "13b"]):
+                score += 20
+            elif "8b" in mid:
+                score += 15
+            elif "7b" in mid:
+                score += 12
             candidates.append((score, m.id))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -168,13 +164,20 @@ def _short_label(model_id: str) -> str:
     mid = model_id.lower()
     for size in ["72b", "70b", "34b", "32b", "13b", "9b", "8b", "7b"]:
         if size in mid:
-            if "llama-3.3" in mid: return f"Llama 3.3 {size.upper()}"
-            if "llama-3.2" in mid: return f"Llama 3.2 {size.upper()}"
-            if "llama-3.1" in mid: return f"Llama 3.1 {size.upper()}"
-            if "llama-3"   in mid: return f"Llama 3 {size.upper()}"
-            if "mixtral"   in mid: return f"Mixtral {size.upper()}"
-            if "gemma"     in mid: return f"Gemma {size.upper()}"
-            if "qwen"      in mid: return f"Qwen {size.upper()}"
+            if "llama-3.3" in mid:
+                return f"Llama 3.3 {size.upper()}"
+            if "llama-3.2" in mid:
+                return f"Llama 3.2 {size.upper()}"
+            if "llama-3.1" in mid:
+                return f"Llama 3.1 {size.upper()}"
+            if "llama-3" in mid:
+                return f"Llama 3 {size.upper()}"
+            if "mixtral" in mid:
+                return f"Mixtral {size.upper()}"
+            if "gemma" in mid:
+                return f"Gemma {size.upper()}"
+            if "qwen" in mid:
+                return f"Qwen {size.upper()}"
     return model_id.split("/")[-1].replace("-", " ").title()
 
 
@@ -215,26 +218,26 @@ CHART_PROMPT_PREFIX = (
 )
 
 _TEXT_FALLBACK_DATA: dict = {
-    "asset":             "Unknown (vision APIs unavailable)",
-    "timeframe":         "Unknown",
+    "asset": "Unknown (vision APIs unavailable)",
+    "timeframe": "Unknown",
     "timeframe_minutes": 5,
-    "current_price":     "Unknown",
-    "trend":             "Unknown — treat as highly volatile",
-    "support":           [],
-    "resistance":        [],
-    "indicators":        {},
-    "patterns":          [],
+    "current_price": "Unknown",
+    "trend": "Unknown — treat as highly volatile",
+    "support": [],
+    "resistance": [],
+    "indicators": {},
+    "patterns": [],
     "technical_summary": (
         "Chart image could not be analysed — all vision APIs are currently "
         "unavailable. The AI committee will debate using strict risk-management "
         "assumptions: highly volatile market, no confirmed trend."
     ),
-    "live_news":          [],
-    "news_summary":       "No live news available. Assume high uncertainty.",
-    "vision_model":       "Text Fallback (no vision API available)",
-    "gemini_vote":        "WAIT",
-    "gemini_confidence":  0,
-    "gemini_reasoning":   "Vision analysis unavailable — apply strict risk management.",
+    "live_news": [],
+    "news_summary": "No live news available. Assume high uncertainty.",
+    "vision_model": "Text Fallback (no vision API available)",
+    "gemini_vote": "WAIT",
+    "gemini_confidence": 0,
+    "gemini_reasoning": "Vision analysis unavailable — apply strict risk management.",
 }
 
 
@@ -242,9 +245,9 @@ def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
     from google import genai
     from google.genai import types
 
-    client     = genai.Client(api_key=require_secret("GEMINI_API_KEY"))
+    client = genai.Client(api_key=require_secret("GEMINI_API_KEY"))
     extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
-    prompt     = CHART_PROMPT_PREFIX + extra_line + "\n" + CHART_ANALYSIS_JSON_SPEC
+    prompt = CHART_PROMPT_PREFIX + extra_line + "\n" + CHART_ANALYSIS_JSON_SPEC
 
     contents = [
         types.Content(
@@ -274,36 +277,46 @@ def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
     return result
 
 
-def _groq_vision(image_bytes: bytes, mime: str, extra: str,
-                 model_id: str, model_label: str) -> dict:
+def _groq_vision(
+    image_bytes: bytes, mime: str, extra: str, model_id: str, model_label: str
+) -> dict:
     from groq import Groq
 
-    client     = Groq(api_key=require_secret("GROQ_API_KEY"))
-    b64_image  = base64.b64encode(image_bytes).decode()
+    client = Groq(api_key=require_secret("GROQ_API_KEY"))
+    b64_image = base64.b64encode(image_bytes).decode()
     extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
-    prompt     = (
-        CHART_PROMPT_PREFIX + extra_line + "\n" + CHART_ANALYSIS_JSON_SPEC
+    prompt = (
+        CHART_PROMPT_PREFIX
+        + extra_line
+        + "\n"
+        + CHART_ANALYSIS_JSON_SPEC
         + "\n\nNote: You may not have live search. Fill live_news with your best "
         "knowledge of recent market events for the asset shown."
     )
     chat = client.chat.completions.create(
         model=model_id,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url",
-                 "image_url": {"url": f"data:{mime};base64,{b64_image}"}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64_image}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
         temperature=0.3,
         max_tokens=1800,
     )
     result = parse_json(chat.choices[0].message.content)
     result["vision_model"] = model_label
-    result.setdefault("gemini_vote",       result.get("vote", "WAIT"))
+    result.setdefault("gemini_vote", result.get("vote", "WAIT"))
     result.setdefault("gemini_confidence", result.get("confidence", 50))
-    result.setdefault("gemini_reasoning",  result.get("reasoning", "Fallback vision model."))
+    result.setdefault(
+        "gemini_reasoning", result.get("reasoning", "Fallback vision model.")
+    )
     return result
 
 
@@ -323,17 +336,19 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
        (Steps 2–3) can still run and produce a FINAL_DECISION.
     """
     RETRIES = 3
-    DELAY   = 3
+    DELAY = 3
 
     # ── 1. Gemini with retries ────────────────────────────────────────────────
     gemini_errors: list[str] = []
     for attempt in range(1, RETRIES + 1):
         try:
-            data   = _gemini_vision(image_bytes, mime, extra)
+            data = _gemini_vision(image_bytes, mime, extra)
             suffix = f" (attempt {attempt}/{RETRIES})" if attempt > 1 else ""
             return data, f"✨ Gemini 2.5 Flash — chart analysis complete{suffix}."
         except Exception as exc:
-            gemini_errors.append(f"Attempt {attempt}: {type(exc).__name__}: {str(exc)[:140]}")
+            gemini_errors.append(
+                f"Attempt {attempt}: {type(exc).__name__}: {str(exc)[:140]}"
+            )
             if attempt < RETRIES:
                 time.sleep(DELAY)
 
@@ -343,20 +358,22 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
     groq_errors: list[str] = []
 
     try:
-        data = _groq_vision(image_bytes, mime, extra,
-                            GROQ_VISION_MODEL, GROQ_VISION_MODEL)
+        data = _groq_vision(
+            image_bytes, mime, extra, GROQ_VISION_MODEL, GROQ_VISION_MODEL
+        )
         gemini_summary = " | ".join(gemini_errors)
         return data, (
             f"⚠️ Gemini failed ({gemini_summary[:180]}). "
             f"Fell back to **{GROQ_VISION_MODEL}** (Groq) — analysis complete."
         )
     except Exception as exc:
-        groq_errors.append(f"{GROQ_VISION_MODEL}: {type(exc).__name__}: {str(exc)[:140]}")
+        groq_errors.append(
+            f"{GROQ_VISION_MODEL}: {type(exc).__name__}: {str(exc)[:140]}"
+        )
 
     # ── 3. Safe text fallback — debate continues regardless ──────────────────
     all_errors = (
-        "Gemini: " + " | ".join(gemini_errors)
-        + " || Groq: " + " | ".join(groq_errors)
+        "Gemini: " + " | ".join(gemini_errors) + " || Groq: " + " | ".join(groq_errors)
     )
     status = (
         "🚨 **All vision APIs failed** — running in text-fallback mode.\n\n"
@@ -374,35 +391,38 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 # STEP 2 — Independent analyst votes
 # ─────────────────────────────────────────────────────────────────────────────
 def build_analyst_prompt(model_name: str, g: dict) -> str:
-    news_lines = "\n".join(
-        f"  • [{n.get('sentiment','?')}] {n.get('headline','')} — {n.get('source','')}"
-        for n in g.get("live_news", [])
-    ) or "  No live news available."
+    news_lines = (
+        "\n".join(
+            f"  • [{n.get('sentiment', '?')}] {n.get('headline', '')} — {n.get('source', '')}"
+            for n in g.get("live_news", [])
+        )
+        or "  No live news available."
+    )
 
-    indicators = "; ".join(
-        f"{k}: {v}" for k, v in g.get("indicators", {}).items()
-    ) or "N/A"
+    indicators = (
+        "; ".join(f"{k}: {v}" for k, v in g.get("indicators", {}).items()) or "N/A"
+    )
 
     return (
         f"You are {model_name}, an expert AI trading analyst.\n\n"
         "Study the following chart analysis and market news, then give your own "
         "independent trading opinion.\n\n"
         "=== CHART ANALYSIS ===\n"
-        f"Vision Model : {g.get('vision_model','?')}\n"
-        f"Asset        : {g.get('asset','?')}\n"
-        f"Timeframe    : {g.get('timeframe','?')}\n"
-        f"Price        : {g.get('current_price','?')}\n"
-        f"Trend        : {g.get('trend','?')}\n"
+        f"Vision Model : {g.get('vision_model', '?')}\n"
+        f"Asset        : {g.get('asset', '?')}\n"
+        f"Timeframe    : {g.get('timeframe', '?')}\n"
+        f"Price        : {g.get('current_price', '?')}\n"
+        f"Trend        : {g.get('trend', '?')}\n"
         f"Support      : {', '.join(g.get('support', []))}\n"
         f"Resistance   : {', '.join(g.get('resistance', []))}\n"
         f"Indicators   : {indicators}\n"
         f"Patterns     : {', '.join(g.get('patterns', []))}\n"
-        f"Summary      : {g.get('technical_summary','')}\n"
-        f"Vision Vote  : {g.get('gemini_vote','?')} ({g.get('gemini_confidence',0)}%)\n"
-        f"Vision Says  : {g.get('gemini_reasoning','')}\n\n"
+        f"Summary      : {g.get('technical_summary', '')}\n"
+        f"Vision Vote  : {g.get('gemini_vote', '?')} ({g.get('gemini_confidence', 0)}%)\n"
+        f"Vision Says  : {g.get('gemini_reasoning', '')}\n\n"
         "=== MARKET NEWS ===\n"
         f"{news_lines}\n"
-        f"Summary: {g.get('news_summary','')}\n"
+        f"Summary: {g.get('news_summary', '')}\n"
         "===================\n\n"
         "Return ONLY valid JSON:\n"
         "{\n"
@@ -418,13 +438,17 @@ def build_analyst_prompt(model_name: str, g: dict) -> str:
 
 def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
     from groq import Groq
+
     client = Groq(api_key=require_secret("GROQ_API_KEY"))
     prompt = build_analyst_prompt(model_name, chart_data)
-    chat   = client.chat.completions.create(
+    chat = client.chat.completions.create(
         model=model_id,
         messages=[
-            {"role": "system", "content": "You are an expert AI trading analyst. Respond with valid JSON only."},
-            {"role": "user",   "content": prompt},
+            {
+                "role": "system",
+                "content": "You are an expert AI trading analyst. Respond with valid JSON only.",
+            },
+            {"role": "user", "content": prompt},
         ],
         temperature=0.4,
         max_tokens=600,
@@ -436,15 +460,21 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
 
 def _call_deepseek(chart_data: dict) -> dict:
     api_key = require_secret("DEEPSEEK_API_KEY")
-    prompt  = build_analyst_prompt("DeepSeek-Chat", chart_data)
-    resp    = requests.post(
+    prompt = build_analyst_prompt("DeepSeek-Chat", chart_data)
+    resp = requests.post(
         "https://api.deepseek.com/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
         json={
             "model": "deepseek-chat",
             "messages": [
-                {"role": "system", "content": "You are an expert AI trading analyst. Respond with valid JSON only."},
-                {"role": "user",   "content": prompt},
+                {
+                    "role": "system",
+                    "content": "You are an expert AI trading analyst. Respond with valid JSON only.",
+                },
+                {"role": "user", "content": prompt},
             ],
             "temperature": 0.4,
             "max_tokens": 600,
@@ -472,32 +502,31 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
     candle-based trade recommendation.
     Primary: Gemini 2.5 Flash.  Fallback: top available Groq text model.
     """
-    tf         = chart_data.get("timeframe", "unknown")
+    tf = chart_data.get("timeframe", "unknown")
     tf_minutes = chart_data.get("timeframe_minutes", 0)
 
-    positions  = f"Vision Model ({chart_data.get('vision_model','?')}): "
-    positions += f"{chart_data.get('gemini_vote','WAIT')} "
-    positions += f"({chart_data.get('gemini_confidence',0)}%) — "
+    positions = f"Vision Model ({chart_data.get('vision_model', '?')}): "
+    positions += f"{chart_data.get('gemini_vote', 'WAIT')} "
+    positions += f"({chart_data.get('gemini_confidence', 0)}%) — "
     positions += chart_data.get("gemini_reasoning", "") + "\n"
     for v in analyst_votes:
         positions += (
-            f"{v.get('model','?')}: {v.get('vote','WAIT')} "
-            f"({v.get('confidence',0)}%) — {v.get('reasoning','')}\n"
-            f"  Analysis  : {v.get('analysis','')}\n"
+            f"{v.get('model', '?')}: {v.get('vote', 'WAIT')} "
+            f"({v.get('confidence', 0)}%) — {v.get('reasoning', '')}\n"
+            f"  Analysis  : {v.get('analysis', '')}\n"
             f"  Key Risks : {', '.join(v.get('key_risks', []))}\n"
         )
 
-    online_names = (
-        [chart_data.get("vision_model", "Vision")] +
-        [v.get("model", "?") for v in analyst_votes]
-    )
+    online_names = [chart_data.get("vision_model", "Vision")] + [
+        v.get("model", "?") for v in analyst_votes
+    ]
 
     prompt = (
         "You are the debate moderator for an AI trading analyst panel.\n\n"
         f"Models that responded ({len(online_names)} online): {', '.join(online_names)}\n\n"
         "=== ALL ANALYST POSITIONS ===\n"
-        + positions +
-        "==============================\n\n"
+        + positions
+        + "==============================\n\n"
         "Tasks:\n"
         "1. Cross-examine — identify key agreements and disagreements.\n"
         "2. Decide FINAL_DECISION (UP / DOWN / WAIT) based on evidence weight.\n"
@@ -533,8 +562,9 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
     try:
         from google import genai
         from google.genai import types
+
         client = genai.Client(api_key=require_secret("GEMINI_API_KEY"))
-        resp   = client.models.generate_content(
+        resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
         )
@@ -543,19 +573,23 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
         # Fallback: top available Groq text model (dynamically discovered)
         try:
             from groq import Groq
+
             fallback_models = _discover_groq_text_models(n=1)
-            fallback_id     = fallback_models[0][0]
-            client_g        = Groq(api_key=require_secret("GROQ_API_KEY"))
-            chat            = client_g.chat.completions.create(
+            fallback_id = fallback_models[0][0]
+            client_g = Groq(api_key=require_secret("GROQ_API_KEY"))
+            chat = client_g.chat.completions.create(
                 model=fallback_id,
                 messages=[
-                    {"role": "system", "content": "You are a trading debate moderator. Respond with valid JSON only."},
-                    {"role": "user",   "content": prompt},
+                    {
+                        "role": "system",
+                        "content": "You are a trading debate moderator. Respond with valid JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
                 max_tokens=1000,
             )
-            result      = parse_json(chat.choices[0].message.content)
+            result = parse_json(chat.choices[0].message.content)
             synth_model = _short_label(fallback_id) + " (Groq fallback)"
         except Exception as groq_err:
             raise RuntimeError(
@@ -569,20 +603,27 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # UI constants & rendering helpers
 # ─────────────────────────────────────────────────────────────────────────────
-VOTE_COLOR = {"UP": "green",  "DOWN": "red",   "WAIT": "orange"}
-VOTE_ICON  = {"UP": "⬆️",    "DOWN": "⬇️",    "WAIT": "⏸️"}
+VOTE_COLOR = {"UP": "green", "DOWN": "red", "WAIT": "orange"}
+VOTE_ICON = {"UP": "⬆️", "DOWN": "⬇️", "WAIT": "⏸️"}
 
 
 def _model_icon(model_name: str) -> str:
     """Return an emoji for any model name based on keyword matching."""
     n = model_name.lower()
-    if "gemini"   in n: return "✨"
-    if "deepseek" in n: return "🔭"
-    if "mixtral"  in n: return "⚗️"
-    if "gemma"    in n: return "💎"
-    if "qwen"     in n: return "🧠"
-    if "vision"   in n: return "👁️"
-    if "llama"    in n: return "🦙"
+    if "gemini" in n:
+        return "✨"
+    if "deepseek" in n:
+        return "🔭"
+    if "mixtral" in n:
+        return "⚗️"
+    if "gemma" in n:
+        return "💎"
+    if "qwen" in n:
+        return "🧠"
+    if "vision" in n:
+        return "👁️"
+    if "llama" in n:
+        return "🦙"
     return "🤖"
 
 
@@ -594,7 +635,7 @@ def badge(vote: str) -> str:
 
 def render_chart_analysis(g: dict, status_msg: str):
     vision = g.get("vision_model", "Vision Model")
-    icon   = _model_icon(vision)
+    icon = _model_icon(vision)
     if any(w in status_msg.lower() for w in ("fallback", "unavailable", "failed")):
         st.warning(status_msg)
     else:
@@ -602,14 +643,17 @@ def render_chart_analysis(g: dict, status_msg: str):
 
     with st.expander(f"{icon} {vision} — Chart Analysis + Market News", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Asset",     g.get("asset", "—"))
+        c1.metric("Asset", g.get("asset", "—"))
         c2.metric("Timeframe", g.get("timeframe", "—"))
-        c3.metric("Trend",     g.get("trend", "—"))
+        c3.metric("Trend", g.get("trend", "—"))
         v = g.get("gemini_vote", "WAIT")
-        c4.metric("Vision Vote", f"{VOTE_ICON.get(v,'')} {v}",
-                  f"{g.get('gemini_confidence', 0)}% confidence")
+        c4.metric(
+            "Vision Vote",
+            f"{VOTE_ICON.get(v, '')} {v}",
+            f"{g.get('gemini_confidence', 0)}% confidence",
+        )
 
-        st.info(f"**Technical Summary:** {g.get('technical_summary','')}")
+        st.info(f"**Technical Summary:** {g.get('technical_summary', '')}")
 
         ca, cb = st.columns(2)
         with ca:
@@ -634,18 +678,18 @@ def render_chart_analysis(g: dict, status_msg: str):
         st.markdown("**📰 Market News**")
         for item in g.get("live_news", []):
             sent = item.get("sentiment", "Neutral")
-            dot  = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
+            dot = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
             st.markdown(
-                f"{dot} **{item.get('headline','')}**  \n*{item.get('source','')}*"
+                f"{dot} **{item.get('headline', '')}**  \n*{item.get('source', '')}*"
             )
-        st.markdown(f"**News Summary:** {g.get('news_summary','')}")
-        st.markdown(f"💬 *{g.get('gemini_reasoning','')}*")
+        st.markdown(f"**News Summary:** {g.get('news_summary', '')}")
+        st.markdown(f"💬 *{g.get('gemini_reasoning', '')}*")
 
 
 def render_vote_card(v: dict, status: str = "online"):
     model = v.get("model", "Unknown")
-    vote  = v.get("vote", "WAIT")
-    icon  = _model_icon(model)
+    vote = v.get("vote", "WAIT")
+    icon = _model_icon(model)
 
     if status == "offline":
         with st.expander(f"🔴 **{model}** — OFFLINE / SKIPPED", expanded=False):
@@ -656,11 +700,11 @@ def render_vote_card(v: dict, status: str = "online"):
         f"{icon} **{model}** — {badge(vote)} — {v.get('confidence', 0)}% confidence",
         expanded=True,
     ):
-        st.markdown(f"**Analysis:** {v.get('analysis','')}")
+        st.markdown(f"**Analysis:** {v.get('analysis', '')}")
         risks = v.get("key_risks", [])
         if risks:
             st.markdown("**Key Risks:** " + " · ".join(f"`{r}`" for r in risks))
-        st.markdown(f"💬 *{v.get('reasoning','')}*")
+        st.markdown(f"💬 *{v.get('reasoning', '')}*")
 
 
 def render_scoreboard(chart_data: dict, analyst_votes: list[dict], offline: list[str]):
@@ -669,29 +713,28 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict], offline: list
     online_entries = [
         {
             "model": vision_name,
-            "vote":  chart_data.get("gemini_vote", "WAIT"),
-            "conf":  chart_data.get("gemini_confidence", 0),
-            "icon":  _model_icon(vision_name),
+            "vote": chart_data.get("gemini_vote", "WAIT"),
+            "conf": chart_data.get("gemini_confidence", 0),
+            "icon": _model_icon(vision_name),
         }
     ] + [
         {
             "model": v.get("model", "?"),
-            "vote":  v.get("vote", "WAIT"),
-            "conf":  v.get("confidence", 0),
-            "icon":  _model_icon(v.get("model", "")),
+            "vote": v.get("vote", "WAIT"),
+            "conf": v.get("confidence", 0),
+            "icon": _model_icon(v.get("model", "")),
         }
         for v in analyst_votes
     ]
     all_entries = online_entries + [
-        {"model": name, "vote": "OFFLINE", "conf": 0, "icon": "🔴"}
-        for name in offline
+        {"model": name, "vote": "OFFLINE", "conf": 0, "icon": "🔴"} for name in offline
     ]
 
     cols = st.columns(max(len(all_entries), 1))
     for col, entry in zip(cols, all_entries):
-        vote  = entry["vote"]
+        vote = entry["vote"]
         color = VOTE_COLOR.get(vote, "#888") if vote != "OFFLINE" else "#888"
-        icon  = VOTE_ICON.get(vote, "❌")   if vote != "OFFLINE" else "❌"
+        icon = VOTE_ICON.get(vote, "❌") if vote != "OFFLINE" else "❌"
         col.markdown(
             f"<div style='text-align:center;padding:10px 4px;"
             f"border:1px solid #444;border-radius:8px;'>"
@@ -708,12 +751,12 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict], offline: list
 
 def render_final_decision(synth: dict):
     decision = synth.get("FINAL_DECISION", "WAIT")
-    color    = VOTE_COLOR.get(decision, "gray")
-    arrow    = VOTE_ICON.get(decision, "❓")
+    color = VOTE_COLOR.get(decision, "gray")
+    arrow = VOTE_ICON.get(decision, "❓")
     strength = synth.get("consensus_strength", "")
-    tally    = synth.get("vote_tally", {})
-    conf     = synth.get("confidence", 0)
-    s_model  = synth.get("_synth_model", "Gemini")
+    tally = synth.get("vote_tally", {})
+    conf = synth.get("confidence", 0)
+    s_model = synth.get("_synth_model", "Gemini")
 
     st.markdown("---")
     st.markdown(f"## 🏆 Final Consensus  *(moderated by {s_model})*")
@@ -727,11 +770,11 @@ def render_final_decision(synth: dict):
         unsafe_allow_html=True,
     )
     c1, c2, c3 = st.columns(3)
-    c1.metric("⬆️ UP",   tally.get("UP",   0))
+    c1.metric("⬆️ UP", tally.get("UP", 0))
     c2.metric("⬇️ DOWN", tally.get("DOWN", 0))
     c3.metric("⏸️ WAIT", tally.get("WAIT", 0))
-    st.markdown(f"**Cross-Examination:** {synth.get('cross_examination','')}")
-    st.info(f"📋 **Moderator Note:** {synth.get('moderator_note','')}")
+    st.markdown(f"**Cross-Examination:** {synth.get('cross_examination', '')}")
+    st.info(f"📋 **Moderator Note:** {synth.get('moderator_note', '')}")
 
 
 def render_trade_recommendation(synth: dict):
@@ -741,19 +784,19 @@ def render_trade_recommendation(synth: dict):
 
     should_trade = ra.get("should_trade", False)
     display_text = ra.get("display_text", "")
-    direction    = ra.get("trade_direction") or ""
-    candles      = ra.get("candle_count")
-    total_mins   = ra.get("total_duration_minutes")
+    direction = ra.get("trade_direction") or ""
+    candles = ra.get("candle_count")
+    total_mins = ra.get("total_duration_minutes")
     no_trade_rsn = ra.get("dont_trade_reason") or ""
 
     st.markdown("---")
     st.markdown("## 🎯 Recommended Action")
 
     if should_trade and direction in ("UP", "DOWN"):
-        bg     = "#062e0f" if direction == "UP" else "#2e0606"
-        txt    = "#00e676" if direction == "UP" else "#ff5252"
+        bg = "#062e0f" if direction == "UP" else "#2e0606"
+        txt = "#00e676" if direction == "UP" else "#ff5252"
         border = "#00c853" if direction == "UP" else "#d50000"
-        arrow  = "⬆️"     if direction == "UP" else "⬇️"
+        arrow = "⬆️" if direction == "UP" else "⬇️"
         st.markdown(
             f"<div style='background:{bg};border:3px solid {border};"
             f"border-radius:14px;padding:30px 24px;margin:10px 0;text-align:center;'>"
@@ -765,9 +808,9 @@ def render_trade_recommendation(synth: dict):
         )
         if candles and total_mins:
             m1, m2, m3 = st.columns(3)
-            m1.metric("Direction",       f"{arrow} {direction}")
+            m1.metric("Direction", f"{arrow} {direction}")
             m2.metric("Candles to Hold", str(candles))
-            m3.metric("Est. Duration",   f"{total_mins} min")
+            m3.metric("Est. Duration", f"{total_mins} min")
     else:
         st.markdown(
             f"<div style='background:#2b1e00;border:3px solid #ff8f00;"
@@ -821,9 +864,13 @@ if not run:
 # Read uploaded image
 uploaded.seek(0)
 image_bytes = uploaded.read()
-ext       = uploaded.name.rsplit(".", 1)[-1].lower()
-mime_map  = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-             "png": "image/png",  "webp": "image/webp"}
+ext = uploaded.name.rsplit(".", 1)[-1].lower()
+mime_map = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
 mime_type = mime_map.get(ext, "image/jpeg")
 
 st.markdown("---")
@@ -850,14 +897,13 @@ _groq_labels = ", ".join(_short_label(mid) for mid, _ in _groq_text_models)
 st.caption(f"🤖 Auto-selected Groq analysts: **{_groq_labels}**")
 
 ANALYST_MODELS: list[tuple[str, str | None, str]] = [
-    ("groq", mid, _short_label(mid))
-    for mid, _ in _groq_text_models
+    ("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models
 ] + [
     ("deepseek", None, "DeepSeek-Chat"),
 ]
 
-analyst_votes:  list[dict] = []
-offline_models: list[str]  = []
+analyst_votes: list[dict] = []
+offline_models: list[str] = []
 
 for backend, model_id, model_name in ANALYST_MODELS:
     with st.spinner(f"{_model_icon(model_name)} {model_name} is analysing…"):
@@ -872,12 +918,13 @@ for backend, model_id, model_name in ANALYST_MODELS:
             err_msg = str(exc)
             st.warning(f"🔴 **{model_name} skipped** — {err_msg[:200]}")
             offline_models.append(model_name)
-            render_vote_card({"model": model_name, "error_msg": err_msg}, status="offline")
+            render_vote_card(
+                {"model": model_name, "error_msg": err_msg}, status="offline"
+            )
 
 if len(analyst_votes) == 0:
     st.error(
-        "All analyst models are currently offline. "
-        "Please try again in a few minutes."
+        "All analyst models are currently offline. Please try again in a few minutes."
     )
     st.stop()
 
@@ -887,7 +934,7 @@ render_scoreboard(chart_data, analyst_votes, offline_models)
 # STEP 3 — Cross-examination & final verdict
 # ══════════════════════════════════════════════════════════════════════════════
 n_online = 1 + len(analyst_votes)
-n_total  = 1 + len(ANALYST_MODELS)
+n_total = 1 + len(ANALYST_MODELS)
 st.markdown("---")
 st.markdown(
     f"## Step 3 — Cross-Examination & Final Verdict  "
