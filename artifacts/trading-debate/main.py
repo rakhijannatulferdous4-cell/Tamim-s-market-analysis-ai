@@ -3,7 +3,7 @@ AI Trading Debate — crash-proof, future-proof.
 
 Pipeline
 ────────
-Step 1  Chart Vision  : Gemini 1.5 Flash  (google-generativeai stable SDK, v1 path)
+Step 1  Chart Vision  : Gemini 2.0 Flash  (google-generativeai stable SDK)
                         → live Groq vision catalog  (seeded with known 2026 models)
                         → text-fallback if all vision APIs fail
 Step 2  Analyst Votes : Top-3 Groq text models  (live auto-discovery)
@@ -11,7 +11,7 @@ Step 2  Analyst Votes : Top-3 Groq text models  (live auto-discovery)
                         + DeepSeek-Chat (skipped gracefully on 402)
                         + any custom models added by the user in the sidebar
                         <think>…</think> tokens stripped before JSON parsing
-Step 3  Final Verdict : Gemini 1.5 Flash synthesis → top Groq text model fallback
+Step 3  Final Verdict : Gemini 2.0 Flash synthesis → top Groq text model fallback
                         → FINAL_DECISION + candle recommendation box
 """
 
@@ -251,13 +251,13 @@ _TEXT_FALLBACK_DATA: dict = {
 
 def _gemini_vision(image_bytes: bytes, extra: str) -> dict:
     """
-    Call Gemini 1.5 Flash via the stable google-generativeai SDK.
+    Call Gemini 2.0 Flash via the stable google-generativeai SDK.
     Passes a PIL Image directly — no blob/Blob, no v1beta path issues.
     """
     import google.generativeai as genai
 
     genai.configure(api_key=require_secret("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
     extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
     prompt = CHART_PROMPT_TEXT + extra_line + "\n" + CHART_ANALYSIS_JSON_SPEC
@@ -265,7 +265,7 @@ def _gemini_vision(image_bytes: bytes, extra: str) -> dict:
     img = Image.open(io.BytesIO(image_bytes))
     response = model.generate_content([img, prompt])
     result = parse_json(response.text)
-    result["vision_model"] = "Gemini 1.5 Flash"
+    result["vision_model"] = "Gemini 2.0 Flash"
     return result
 
 
@@ -324,7 +324,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
     Returns (chart_data, status_message). Never raises.
 
     Chain:
-    1. Gemini 1.5 Flash (stable SDK) — single shot, instant fallback on ANY error.
+    1. Gemini 2.0 Flash (stable SDK) — single shot, instant fallback on ANY error.
     2. Groq vision — tries seeded candidates + live catalog discovery in order.
     3. Text fallback — debate still runs with high-volatility context.
     """
@@ -332,7 +332,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
     gemini_error = ""
     try:
         data = _gemini_vision(image_bytes, extra)
-        return data, "✨ Gemini 1.5 Flash — chart analysis complete."
+        return data, "✨ Gemini 2.0 Flash — chart analysis complete."
     except Exception as exc:
         gemini_error = f"{type(exc).__name__}: {str(exc)[:220]}"
 
@@ -537,16 +537,16 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
 def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
     """
     Cross-examines all analyst opinions → FINAL_DECISION + candle recommendation.
-    Primary: Gemini 1.5 Flash (stable SDK).  Fallback: top Groq text model.
+    Primary: Gemini 2.0 Flash (stable SDK).  Fallback: top Groq text model.
     """
     import google.generativeai as genai
 
     prompt = _build_synthesis_prompt(chart_data, analyst_votes)
 
-    synth_model = "Gemini 1.5 Flash"
+    synth_model = "Gemini 2.0 Flash"
     try:
         genai.configure(api_key=require_secret("GEMINI_API_KEY"))
-        model    = genai.GenerativeModel("gemini-1.5-flash")
+        model    = genai.GenerativeModel("gemini-2.0-flash")
         response = model.generate_content(prompt)
         result   = parse_json(response.text)
     except Exception as gemini_err:
