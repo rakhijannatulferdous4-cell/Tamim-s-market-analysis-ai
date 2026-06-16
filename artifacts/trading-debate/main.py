@@ -3,12 +3,15 @@ AI Trading Debate — clean, future-proof, crash-proof.
 
 Pipeline
 ────────
-Step 1  Chart Vision  : Gemini 2.5 Flash (3 retries)
-                        → llama-3.2-11b-vision-preview (Groq, hardcoded)
+Step 1  Chart Vision  : Gemini 1.5 Flash (single shot, immediate fallback)
+                        → llama-3.2-11b-vision-preview (Groq, hardcoded first)
+                        → dynamic Groq vision discovery (any model with 'vision')
                         → text-fallback if all vision APIs fail
 Step 2  Analyst Votes : Top-3 Groq text models (auto-selected live)
+                          preference: llama-3.3-70b-versatile, qwen-2.5-32b
                         + DeepSeek-Chat (skipped gracefully on 402)
-Step 3  Final Verdict : Gemini synthesis → Groq fallback
+                        <think>…</think> tokens stripped from Qwen/DeepSeek before parsing
+Step 3  Final Verdict : Gemini 1.5 Flash synthesis → top Groq model fallback
                         → FINAL_DECISION + candle recommendation box
 """
 
@@ -83,8 +86,8 @@ _GROQ_TEXT_EXCLUDE = frozenset(
 
 _GROQ_TEXT_FALLBACK = [
     ("llama-3.3-70b-versatile", "Llama 3.3 70B"),
+    ("qwen-2.5-32b",            "Qwen 2.5 32B"),
     ("llama-3.1-8b-instant",    "Llama 3.1 8B"),
-    ("mixtral-8x7b-32768",      "Mixtral 8x7B"),
 ]
 
 
@@ -118,17 +121,27 @@ def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
         client = Groq(api_key=require_secret("GROQ_API_KEY"))
         listing = client.models.list()
 
+        # Explicit top-priority models get a guaranteed high score
+        _PREFERRED = {
+            "llama-3.3-70b-versatile": 200,
+            "qwen-2.5-32b":            190,
+        }
+
         candidates: list[tuple[int, str]] = []
         for m in listing.data:
             mid = m.id.lower()
             if any(x in mid for x in _GROQ_TEXT_EXCLUDE):
+                continue
+            # Check explicit preferences first
+            if m.id in _PREFERRED:
+                candidates.append((_PREFERRED[m.id], m.id))
                 continue
             # Score by family (higher = newer / more capable)
             score = 0
             if "llama-3.3" in mid:
                 score += 100
             elif "qwen" in mid:
-                score += 90  # Qwen3 32B is top-tier
+                score += 90  # Qwen 2.5 / Qwen3 are top-tier
             elif "llama-3.2" in mid:
                 score += 80
             elif "llama-3.1" in mid:
@@ -326,15 +339,13 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 
     Strategy
     ────────
-    1. Gemini 1.5 Flash — single attempt; on ANY error (429, 503, quota, etc.)
-       immediately fall through to Groq.  Gemini stays in the committee
-       scoreboard as "Temporarily Offline" so users know it was attempted.
-    2. Groq vision — hardcoded llama-3.2-11b-vision-preview (active 2026 model).
-       Image bytes are base64-encoded and passed as a data-URI — correct format.
-    3. Text fallback — if both vision APIs fail the debate still runs with a
-       "highly volatile / strict risk management" context.
+    1. Gemini 1.5 Flash — single attempt; on ANY error immediately fall through.
+    2. Groq vision — hardcoded llama-3.2-11b-vision-preview tried first (fastest),
+       then any additional vision models discovered live from Groq's catalog.
+       Image bytes are base64-encoded as a data:{mime};base64,… URI — correct format.
+    3. Text fallback — debate still runs with high-volatility context if all fail.
     """
-    # ── 1. Gemini — one shot, immediate fallback on any error ─────────────────
+    # ── 1. Gemini — single shot, immediate fallback on any error ──────────────
     gemini_error = ""
     try:
         data = _gemini_vision(image_bytes, mime, extra)
@@ -342,28 +353,31 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
     except Exception as exc:
         gemini_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
-    # ── 2. Groq vision fallback — hardcoded active model ─────────────────────
-    # llama-3.2-11b-vision-preview accepts base64 image_url data-URIs.
-    GROQ_VISION_MODEL = "llama-3.2-11b-vision-preview"
-    groq_errors: list[str] = []
+    # ── 2. Groq vision — hardcoded first, then dynamic discovery ─────────────
+    # Build ordered list: hardcoded active model, then any others from catalog.
+    HARDCODED = "llama-3.2-11b-vision-preview"
+    groq_vision_queue: list[str] = [HARDCODED]
+    for mid, _ in _discover_groq_vision_models():
+        if mid not in groq_vision_queue:
+            groq_vision_queue.append(mid)
 
-    try:
-        data = _groq_vision(
-            image_bytes, mime, extra, GROQ_VISION_MODEL, GROQ_VISION_MODEL
-        )
-        # Keep Gemini visible in the committee as "Temporarily Offline"
-        data.setdefault("gemini_vote",       "Offline")
-        data.setdefault("gemini_confidence", 0)
-        data.setdefault("gemini_reasoning",
-                        f"Gemini temporarily offline — {gemini_error[:120]}")
-        return data, (
-            f"⚠️ Gemini 1.5 Flash offline ({gemini_error[:180]}). "
-            f"Fell back to **{GROQ_VISION_MODEL}** (Groq) — analysis complete."
-        )
-    except Exception as exc:
-        groq_errors.append(
-            f"{GROQ_VISION_MODEL}: {type(exc).__name__}: {str(exc)[:140]}"
-        )
+    groq_errors: list[str] = []
+    for vision_model in groq_vision_queue:
+        try:
+            data = _groq_vision(image_bytes, mime, extra, vision_model, vision_model)
+            # Keep Gemini slot in the committee scoreboard — show as Offline
+            data.setdefault("gemini_vote",       "Offline")
+            data.setdefault("gemini_confidence", 0)
+            data.setdefault("gemini_reasoning",
+                            f"Gemini temporarily offline — {gemini_error[:120]}")
+            return data, (
+                f"⚠️ Gemini offline ({gemini_error[:140]}). "
+                f"Fell back to **{vision_model}** (Groq vision) — analysis complete."
+            )
+        except Exception as exc:
+            groq_errors.append(
+                f"{vision_model}: {type(exc).__name__}: {str(exc)[:100]}"
+            )
 
     # ── 3. Safe text fallback — debate continues regardless ──────────────────
     all_errors = (
@@ -551,15 +565,15 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
         "}"
     )
 
-    # Primary: Gemini
-    synth_model = "Gemini 2.5 Flash"
+    # Primary: Gemini 1.5 Flash (consistent with vision step)
+    synth_model = "Gemini 1.5 Flash"
     try:
         from google import genai
         from google.genai import types
 
         client = genai.Client(api_key=require_secret("GEMINI_API_KEY"))
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-1.5-flash",
             contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
         )
         result = parse_json(resp.text)
