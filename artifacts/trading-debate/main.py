@@ -435,6 +435,7 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
     )
     result = parse_json(chat.choices[0].message.content)
     result.setdefault("model", model_name)
+    result["_platform"] = "Groq"
     return result
 
 
@@ -467,6 +468,7 @@ def _call_deepseek(chart_data: dict) -> dict:
     resp.raise_for_status()
     result = parse_json(resp.json()["choices"][0]["message"]["content"])
     result.setdefault("model", "DeepSeek-Chat")
+    result["_platform"] = "DeepSeek"
     return result
 
 
@@ -722,6 +724,16 @@ textarea:focus, input[type="text"]:focus { border-color: #00b4ff !important; }
     border-left:3px solid #00b4ff; padding-left:12px; margin:24px 0 10px;
 }
 
+/* ── Platform badges (Groq / DeepSeek / Gemini) ─────────────────────── */
+.platform-badge {
+    font-size:.65rem; font-weight:800; padding:2px 7px;
+    border-radius:5px; letter-spacing:.06em; vertical-align:middle;
+}
+.platform-groq    { background:#1a2e10; color:#6ee73a; border:1px solid #4aaa1a; }
+.platform-deepseek{ background:#0d1f3c; color:#60a5fa; border:1px solid #3b82f6; }
+.platform-gemini  { background:#1e0d38; color:#c084fc; border:1px solid #9333ea; }
+.platform-custom  { background:#1a1a2e; color:#94a3b8; border:1px solid #475569; }
+
 /* ── Sidebar model tags ─────────────────────────────────────────────── */
 .custom-model-tag {
     display:inline-flex; align-items:center; gap:6px;
@@ -799,6 +811,17 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
         st.markdown("💬 *" + g.get("gemini_reasoning", "") + "*")
 
 
+def _platform_badge(platform: str) -> str:
+    p = platform.lower()
+    if p == "groq":
+        return "<span class='platform-badge platform-groq'>⚡ GROQ</span>"
+    if p == "deepseek":
+        return "<span class='platform-badge platform-deepseek'>🔭 DEEPSEEK</span>"
+    if p == "gemini":
+        return "<span class='platform-badge platform-gemini'>✨ GEMINI</span>"
+    return "<span class='platform-badge platform-custom'>🤖 " + platform.upper() + "</span>"
+
+
 def render_vote_card(v: dict, status: str = "online") -> None:
     model    = v.get("model",      "Unknown")
     vote     = v.get("vote",       "WAIT")
@@ -807,13 +830,19 @@ def render_vote_card(v: dict, status: str = "online") -> None:
     analysis = v.get("analysis",   "")
     risks    = v.get("key_risks",  [])
     reason   = v.get("reasoning",  "")
+    platform = v.get("_platform",  "")
+    badge    = _platform_badge(platform) if platform else ""
 
     if status == "offline":
         err = str(v.get("error_msg", "This model did not respond."))[:240]
+        plat = v.get("_platform", "")
+        b    = _platform_badge(plat) if plat else ""
         st.markdown(
             "<div class='ai-card offline'>"
             "<div class='card-row'>"
-            "<span class='model-lbl'>🔴 " + icon + " " + model + " — OFFLINE / SKIPPED</span>"
+            "<span class='model-lbl'>🔴 " + icon + " " + model + "</span>"
+            + b +
+            "<span style='font-size:.8rem;color:#ff6080;margin-left:4px;'>— OFFLINE / SKIPPED</span>"
             "</div>"
             "<p class='err-txt'>" + err + "</p>"
             "</div>",
@@ -829,6 +858,7 @@ def render_vote_card(v: dict, status: str = "online") -> None:
         "<div class='ai-card'>"
         "<div class='card-row'>"
         "<span class='model-lbl'>" + icon + " " + model + "</span>"
+        + badge +
         "<span class='vote-pill' style='color:" + color + ";border-color:" + color + ";'>"
         + vote_icon + " " + vote + "</span>"
         "<span class='conf-lbl'>" + str(conf) + "% confidence</span>"
@@ -847,18 +877,22 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
                 unsafe_allow_html=True)
 
     vision_name = chart_data.get("vision_model", "Vision")
+    vision_platform = "Gemini" if "gemini" in vision_name.lower() else "Groq"
+
     entries = [{
-        "model": vision_name,
-        "vote":  chart_data.get("gemini_vote", "WAIT"),
-        "conf":  chart_data.get("gemini_confidence", 0),
-        "icon":  _model_icon(vision_name),
+        "model":    vision_name,
+        "vote":     chart_data.get("gemini_vote", "WAIT"),
+        "conf":     chart_data.get("gemini_confidence", 0),
+        "icon":     _model_icon(vision_name),
+        "platform": vision_platform,
     }] + [{
-        "model": v.get("model", "?"),
-        "vote":  v.get("vote",  "WAIT"),
-        "conf":  v.get("confidence", 0),
-        "icon":  _model_icon(v.get("model", "")),
+        "model":    v.get("model", "?"),
+        "vote":     v.get("vote",  "WAIT"),
+        "conf":     v.get("confidence", 0),
+        "icon":     _model_icon(v.get("model", "")),
+        "platform": v.get("_platform", ""),
     } for v in analyst_votes] + [
-        {"model": nm, "vote": "OFFLINE", "conf": 0, "icon": "🔴"}
+        {"model": nm, "vote": "OFFLINE", "conf": 0, "icon": "🔴", "platform": ""}
         for nm in offline
     ]
 
@@ -868,9 +902,11 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
         color    = _NEON.get(vote, "#555")
         icon     = VOTE_ICON.get(vote, "❌") if vote not in ("OFFLINE", "Offline") else "❌"
         conf_txt = "offline" if vote in ("OFFLINE", "Offline") else str(entry["conf"]) + "% conf"
+        plat_html = _platform_badge(entry["platform"]) if entry["platform"] else ""
         col.markdown(
             "<div class='sb-tile' style='border-color:" + color + "22;'>"
             "<div class='sb-model-lbl'>" + entry["icon"] + " " + entry["model"] + "</div>"
+            "<div style='margin:4px 0;'>" + plat_html + "</div>"
             "<div class='sb-vote-icon'>" + icon + "</div>"
             "<div class='sb-vote-txt' style='color:" + color + ";'>" + vote + "</div>"
             "<div class='sb-conf-txt'>" + conf_txt + "</div>"
