@@ -587,6 +587,7 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
     result = parse_json(raw)
     result.setdefault("model", model_name)
     result["_platform"] = "Groq"
+    result["_model_id"]  = model_id          # stored for Round 2 deliberation
     return result
 
 
@@ -620,7 +621,138 @@ def _call_deepseek(chart_data: dict) -> dict:
     result = parse_json(resp.json()["choices"][0]["message"]["content"])
     result.setdefault("model", "DeepSeek-Chat")
     result["_platform"] = "DeepSeek"
+    result["_model_id"]  = "deepseek-chat"   # stored for Round 2 deliberation
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DELIBERATION ROUND — AIs share all reasoning and submit final votes
+# ─────────────────────────────────────────────────────────────────────────────
+def _call_groq_raw(model_id: str, model_name: str, prompt: str) -> dict:
+    """Call Groq with a custom prompt (used for deliberation round)."""
+    from groq import Groq
+    client   = Groq(api_key=require_secret("GROQ_API_KEY"))
+    sys_msg  = {"role": "system",
+                "content": "You are an AI trading analyst in a structured debate. Respond with valid JSON only."}
+    user_msg = {"role": "user", "content": prompt}
+    raw = None
+    try:
+        chat = client.chat.completions.create(
+            model=model_id, messages=[sys_msg, user_msg],
+            temperature=0.3, max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+        raw = chat.choices[0].message.content
+    except Exception:
+        chat = client.chat.completions.create(
+            model=model_id, messages=[sys_msg, user_msg],
+            temperature=0.3, max_tokens=500,
+        )
+        raw = chat.choices[0].message.content
+    result = parse_json(raw)
+    result.setdefault("model", model_name)
+    result["_platform"] = "Groq"
+    return result
+
+
+def _call_deepseek_raw(model_name: str, prompt: str) -> dict:
+    """Call DeepSeek with a custom prompt (used for deliberation round)."""
+    api_key = require_secret("DEEPSEEK_API_KEY")
+    resp = requests.post(
+        "https://api.deepseek.com/chat/completions",
+        headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+        json={
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "You are an AI trading analyst. Respond with valid JSON only."},
+                {"role": "user",   "content": prompt},
+            ],
+            "temperature": 0.3, "max_tokens": 500,
+        },
+        timeout=40,
+    )
+    if resp.status_code == 402:
+        raise RuntimeError("DeepSeek 402")
+    resp.raise_for_status()
+    result = parse_json(resp.json()["choices"][0]["message"]["content"])
+    result.setdefault("model", model_name)
+    result["_platform"] = "DeepSeek"
+    return result
+
+
+def _build_deliberation_prompt(model_name: str, all_votes: list[dict]) -> str:
+    """
+    Build the Round 2 prompt for one analyst: it sees every peer's
+    vote + full reasoning from Round 1, then submits its final position.
+    """
+    from collections import Counter
+    positions = ""
+    for v in all_votes:
+        name = v.get("model", "?")
+        tag  = "YOUR initial vote" if name == model_name else name
+        positions += (
+            tag + ": " + v.get("vote", "?")
+            + " (" + str(v.get("confidence", 0)) + "%) — "
+            + v.get("reasoning", "") + "\n"
+            "  Full analysis: " + v.get("analysis", "") + "\n"
+            "  Key risks    : " + ", ".join(v.get("key_risks", [])) + "\n\n"
+        )
+    majority = Counter(v.get("vote", "WAIT") for v in all_votes).most_common(1)[0][0]
+    own_vote = next((v.get("vote", "?")
+                     for v in all_votes if v.get("model") == model_name), "?")
+    return (
+        "You are " + model_name + ", participating in a structured AI trading debate.\n"
+        "All analysts have submitted their Round 1 positions. "
+        "Now read every peer's full reasoning below.\n\n"
+        "=== ROUND 1 — ALL ANALYST POSITIONS ===\n"
+        + positions
+        + "========================================\n"
+        "Majority vote so far : " + majority + "\n"
+        "Your Round 1 vote    : " + own_vote + "\n\n"
+        "Deliberate carefully:\n"
+        "• Did you miss any pattern or news that colleagues caught?\n"
+        "• Is the majority backed by stronger evidence than your view?\n"
+        "• Do you have unique insight that justifies dissent?\n\n"
+        "Submit your FINAL vote after deliberation.\n\n"
+        "Return ONLY valid JSON — no markdown:\n"
+        '{"model": "' + model_name + '", '
+        '"vote": "UP"|"DOWN"|"WAIT", '
+        '"confidence": 0-100, '
+        '"reasoning": "<final stance and whether/why you agree or disagree with peers>", '
+        '"changed_mind": true|false}'
+    )
+
+
+def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
+    """
+    Round 2: every analyst sees all peers' full reasoning and gives a
+    final vote.  Falls back to Round 1 result on any API failure.
+    Returns a list in the same format as analyst_votes.
+    """
+    revised: list[dict] = []
+    for v in analyst_votes:
+        model_name = v.get("model", "?")
+        model_id   = v.get("_model_id", "")
+        platform   = v.get("_platform", "Groq")
+        prompt     = _build_deliberation_prompt(model_name, analyst_votes)
+        try:
+            if platform == "Groq" and model_id:
+                r = _call_groq_raw(model_id, model_name, prompt)
+            elif platform == "DeepSeek":
+                r = _call_deepseek_raw(model_name, prompt)
+            else:
+                revised.append({**v, "_deliberated": False, "_round1_vote": v.get("vote", "?")})
+                continue
+            r["_platform"]    = platform
+            r["_model_id"]    = model_id
+            r["_deliberated"] = True
+            r["_round1_vote"] = v.get("vote", "?")
+            r.setdefault("key_risks", v.get("key_risks", []))
+            r.setdefault("analysis",  v.get("analysis", ""))
+            revised.append(r)
+        except Exception:
+            revised.append({**v, "_deliberated": False, "_round1_vote": v.get("vote", "?")})
+    return revised
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1238,6 +1370,102 @@ def render_final_decision(synth: dict) -> None:
     st.info("📋 **Moderator Note:** " + synth.get("moderator_note", ""))
 
 
+def render_deliberation_round(round1: list[dict], round2: list[dict]) -> None:
+    """
+    Deliberation panel — shows what each AI decided after reading all peers'
+    reasoning, including who changed their mind and why.
+    """
+    from collections import Counter
+
+    st.markdown("---")
+    st.markdown(
+        "<div class='step-header'>🔄 Deliberation Round — AIs Share Logic & Debate</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='font-size:.8rem;color:#566880;margin-bottom:12px;'>"
+        "Each AI read all peers' full reasoning and submitted a final vote. "
+        "These revised positions are what the moderator uses for the verdict.</p>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Tally shift summary ───────────────────────────────────────────────────
+    r1_tally = Counter(v.get("vote", "?") for v in round1)
+    r2_tally = Counter(v.get("vote", "?") for v in round2)
+    changed  = sum(1 for r in round2
+                   if r.get("_deliberated") and r.get("_round1_vote","?") != r.get("vote","?"))
+
+    def _tally_html(tally: Counter) -> str:
+        return "  ·  ".join(
+            "<strong style='color:" + _NEON.get(v, "#aaa") + ";'>" + v + ": " + str(c) + "</strong>"
+            for v, c in tally.most_common()
+        )
+
+    shift_note = (
+        "<div style='font-size:.75rem;color:#ffaa00;margin-top:8px;'>🔄 "
+        + str(changed) + " analyst(s) changed position after deliberation.</div>"
+        if changed else
+        "<div style='font-size:.75rem;color:#00ff88;margin-top:8px;'>"
+        "✅ All analysts maintained their Round 1 positions.</div>"
+    )
+    st.markdown(
+        "<div class='ai-card' style='padding:14px 18px;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:.88rem;'>"
+        "<tr><td style='color:#566880;font-size:.72rem;width:100px;padding-bottom:6px;'>"
+        "Round 1</td><td>" + _tally_html(r1_tally) + "</td></tr>"
+        "<tr><td style='color:#566880;font-size:.72rem;padding-bottom:4px;'>"
+        "After Debate</td><td>" + _tally_html(r2_tally) + "</td></tr>"
+        "</table>" + shift_note + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Individual deliberation cards ────────────────────────────────────────
+    n        = len(round2)
+    ncols    = min(n, 3)
+    cols     = st.columns(ncols) if n > 1 else [st.container()]
+
+    for idx, r2 in enumerate(round2):
+        model_name  = r2.get("model", "?")
+        platform    = r2.get("_platform", "Groq")
+        r1_vote     = r2.get("_round1_vote", r2.get("vote", "?"))
+        r2_vote     = r2.get("vote", "?")
+        deliberated = r2.get("_deliberated", False)
+        flipped     = deliberated and r1_vote != r2_vote
+        conf        = r2.get("confidence", 0)
+        reasoning   = r2.get("reasoning", "")
+        color       = _NEON.get(r2_vote, "#6a82a0")
+
+        badge_html = (
+            "<span style='font-size:.65rem;color:#ffaa00;font-weight:800;'>🔄 REVISED</span>"
+            if flipped else
+            "<span style='font-size:.65rem;color:#00ff88;font-weight:800;'>✅ MAINTAINED</span>"
+        ) if deliberated else (
+            "<span style='font-size:.62rem;color:#566880;'>⚠️ Round 1 kept</span>"
+        )
+
+        with cols[idx % ncols]:
+            st.markdown(
+                "<div class='ai-card' style='border-color:" + color + "33;text-align:center;'>"
+                "<div style='display:flex;justify-content:space-between;align-items:center;"
+                "margin-bottom:8px;'>"
+                + _platform_badge(platform) + badge_html + "</div>"
+                "<div style='font-size:.78rem;color:#8090a8;margin-bottom:4px;'>"
+                + model_name + "</div>"
+                + ("<div style='font-size:.72rem;color:#566880;'>"
+                   "was: <span style='text-decoration:line-through;color:#ff6080;'>"
+                   + VOTE_ICON.get(r1_vote, "") + " " + r1_vote + "</span></div>"
+                   if flipped else "")
+                + "<div style='font-size:1.8rem;font-weight:900;color:" + color + ";margin:6px 0;'>"
+                + VOTE_ICON.get(r2_vote, "❓") + " " + r2_vote + "</div>"
+                "<div style='font-size:.72rem;color:#6a82a0;'>" + str(conf) + "% confidence</div>"
+                "<div style='font-size:.78rem;color:#5e7a9a;font-style:italic;"
+                "margin-top:8px;line-height:1.5;text-align:left;'>"
+                + reasoning + "</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+
 def render_trade_recommendation(synth: dict) -> None:
     ra = synth.get("recommended_action", {})
     if not ra:
@@ -1483,8 +1711,16 @@ render_chart_analysis(chart_data, vision_status)
 # STEP 2 — Independent analyst votes
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
-st.markdown("<div class='step-header'>Step 2 — Independent Analyst Votes</div>",
-            unsafe_allow_html=True)
+st.markdown(
+    "<div class='step-header'>Step 2 — Round 1: Independent Analyst Votes</div>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<p style='font-size:.78rem;color:#566880;margin:-6px 0 8px;'>"
+    "Each AI votes independently with no knowledge of other opinions. "
+    "A deliberation round follows where they share logic and can revise.</p>",
+    unsafe_allow_html=True,
+)
 
 with st.spinner("⚡ Discovering active Groq text models…"):
     _groq_text_models = _discover_groq_text_models(n=3)
@@ -1530,14 +1766,23 @@ if not analyst_votes:
 render_scoreboard(chart_data, analyst_votes, offline_models)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Cross-examination & final verdict
+# DELIBERATION — AIs share full reasoning and submit revised final votes
 # ══════════════════════════════════════════════════════════════════════════════
-n_online = 1 + len(analyst_votes)
+with st.spinner("🔄 Running deliberation round — AIs reading each other's reasoning…"):
+    revised_votes = run_deliberation_round(analyst_votes)
+
+render_deliberation_round(analyst_votes, revised_votes)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Cross-examination & final verdict (uses post-deliberation votes)
+# ══════════════════════════════════════════════════════════════════════════════
+n_online = 1 + len(revised_votes)
 n_total  = 1 + len(ANALYST_MODELS)
 st.markdown("---")
 st.markdown(
     "<div class='step-header'>Step 3 — Cross-Examination & Final Verdict"
     "<span style='font-size:.8rem;font-weight:400;color:#566880;margin-left:8px;'>"
+    "based on post-deliberation positions · "
     + str(n_online) + "/" + str(n_total) + " models online</span></div>",
     unsafe_allow_html=True,
 )
@@ -1548,9 +1793,9 @@ if offline_models:
         unsafe_allow_html=True,
     )
 
-with st.spinner("🧠 Cross-examining all opinions and computing final verdict…"):
+with st.spinner("🧠 Cross-examining all deliberated positions and computing final verdict…"):
     try:
-        synthesis = step3_synthesize(chart_data, analyst_votes)
+        synthesis = step3_synthesize(chart_data, revised_votes)
     except Exception as exc:
         st.error("**Final synthesis failed:** " + str(exc))
         st.stop()
