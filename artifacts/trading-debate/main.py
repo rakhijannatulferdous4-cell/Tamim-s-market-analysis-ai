@@ -398,6 +398,79 @@ def _gemini_text_vote(chart_data: dict) -> dict:
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Real-time news search via DuckDuckGo (no API key required)
+# ─────────────────────────────────────────────────────────────────────────────
+def _search_market_news(asset: str, max_results: int = 8) -> list[dict]:
+    """
+    Fetch the latest market news for `asset` from DuckDuckGo.
+    Tries news endpoint first, falls back to text search.
+    Never raises — returns [] on any failure.
+    """
+    if not asset or "Unknown" in asset or len(asset) < 2:
+        return []
+    try:
+        from duckduckgo_search import DDGS
+        query = asset + " price market trading analysis today"
+        with DDGS() as ddgs:
+            results = list(ddgs.news(keywords=query, max_results=max_results, timelimit="w"))
+        if results:
+            return results
+        # Retry without time limit if nothing found in last week
+        with DDGS() as ddgs:
+            return list(ddgs.news(keywords=asset + " trading outlook", max_results=max_results))
+    except Exception:
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                return list(ddgs.text(
+                    keywords=asset + " price today technical analysis signal",
+                    max_results=max_results,
+                ))
+        except Exception:
+            return []
+
+
+def _inject_real_news(chart_data: dict) -> dict:
+    """
+    Perform a DuckDuckGo news search for the charted asset and inject
+    real headlines into chart_data. Replaces the AI-hallucinated live_news
+    with actual web results.  Mutates and returns chart_data.
+    """
+    asset = chart_data.get("asset", "")
+    raw   = _search_market_news(asset)
+    if not raw:
+        chart_data.setdefault("live_news", [])
+        chart_data.setdefault("news_context", "")
+        chart_data["news_searched"] = False
+        return chart_data
+
+    live_news = []
+    context_lines = []
+    for n in raw[:8]:
+        title  = (n.get("title") or n.get("body", ""))[:160]
+        source = n.get("source") or n.get("href", "")[:60]
+        date   = n.get("date", "")[:10]
+        url    = n.get("url") or n.get("href", "")
+        body   = n.get("body", "")[:200]
+        live_news.append({
+            "headline": title,
+            "sentiment": "Neutral",   # analysts will judge sentiment
+            "source": source,
+            "date": date,
+            "url": url,
+            "body": body,
+        })
+        context_lines.append(
+            "  • [" + date + "] " + title + " — " + source
+        )
+
+    chart_data["live_news"]     = live_news
+    chart_data["news_context"]  = "\n".join(context_lines)
+    chart_data["news_searched"] = True
+    return chart_data
+
+
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
     Runs BOTH Gemini AND Groq vision — each always gets its own committee vote.
@@ -505,52 +578,79 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 # STEP 2 — Independent analyst votes
 # ─────────────────────────────────────────────────────────────────────────────
 def build_analyst_prompt(model_name: str, g: dict) -> str:
-    news_lines = (
-        "\n".join(
-            "  • [" + n.get("sentiment", "?") + "] "
-            + n.get("headline", "") + " — " + n.get("source", "")
-            for n in g.get("live_news", [])
-        )
-        or "  No live news available."
-    )
     indicators = (
-        "; ".join(k + ": " + str(v) for k, v in g.get("indicators", {}).items())
-        or "N/A"
+        "\n".join("    " + k + ": " + str(v)
+                  for k, v in g.get("indicators", {}).items())
+        or "    Not visible in chart image"
     )
+
+    # Prefer real web-searched news; fall back to AI-generated news list
+    news_ctx = g.get("news_context", "")
+    if not news_ctx:
+        news_ctx = (
+            "\n".join(
+                "  • [" + n.get("sentiment", "?") + "] "
+                + n.get("headline", "") + " — " + n.get("source", "")
+                + (" (" + n.get("date", "") + ")" if n.get("date") else "")
+                for n in g.get("live_news", [])
+            )
+            or "  No live news available at this time."
+        )
+
     return (
-        "You are " + model_name + ", an expert AI trading analyst.\n\n"
-        "Study the following chart analysis and market news, then give your own "
-        "independent trading opinion.\n\n"
-        "=== CHART ANALYSIS ===\n"
-        "Vision Model : " + g.get("vision_model", "?") + "\n"
-        "Asset        : " + g.get("asset", "?") + "\n"
-        "Timeframe    : " + g.get("timeframe", "?") + "\n"
-        "Price        : " + g.get("current_price", "?") + "\n"
-        "Trend        : " + g.get("trend", "?") + "\n"
-        "Support      : " + ", ".join(g.get("support", [])) + "\n"
-        "Resistance   : " + ", ".join(g.get("resistance", [])) + "\n"
-        "Indicators   : " + indicators + "\n"
-        "Patterns     : " + ", ".join(g.get("patterns", [])) + "\n"
-        "Summary      : " + g.get("technical_summary", "") + "\n"
-        "Gemini Vote  : " + str(g.get("gemini_vote", "?"))
-        + " (" + str(g.get("gemini_confidence", 0)) + "%)\n"
-        "Gemini Says  : " + g.get("gemini_reasoning", "") + "\n"
-        "Groq Vision  : " + str(g.get("groq_vision_vote", "?"))
-        + " (" + str(g.get("groq_vision_confidence", 0)) + "%) via "
-        + g.get("groq_vision_model", "Groq") + "\n"
-        "Groq Says    : " + g.get("groq_vision_reasoning", "") + "\n\n"
-        "=== MARKET NEWS ===\n"
-        + news_lines + "\n"
-        "Summary: " + g.get("news_summary", "") + "\n"
-        "===================\n\n"
-        "Return ONLY valid JSON — no markdown:\n"
+        "You are " + model_name + ", a senior AI quant-analyst and trading strategist.\n\n"
+        "Below is everything you need: live chart data, real-time news, and vision AI\n"
+        "readings. Study ALL of it rigorously, then produce a high-conviction trade signal.\n\n"
+
+        "══════════════════════════════════════════════════════\n"
+        "  SECTION 1 — CHART TECHNICAL DATA\n"
+        "══════════════════════════════════════════════════════\n"
+        "Asset        : " + g.get("asset", "Unknown") + "\n"
+        "Timeframe    : " + g.get("timeframe", "Unknown") + "\n"
+        "Current Price: " + g.get("current_price", "?") + "\n"
+        "Trend        : " + g.get("trend", "Unknown") + "\n"
+        "Support      : " + (", ".join(g.get("support", [])) or "None identified") + "\n"
+        "Resistance   : " + (", ".join(g.get("resistance", [])) or "None identified") + "\n"
+        "Indicators:\n" + indicators + "\n"
+        "Chart Patterns: " + (", ".join(g.get("patterns", [])) or "None observed") + "\n"
+        "Technical Summary:\n  " + g.get("technical_summary", "") + "\n\n"
+        "Vision AI Readings (chart screenshot analysed by multimodal models):\n"
+        "  Gemini 2.0 Flash → " + str(g.get("gemini_vote", "?"))
+        + " (" + str(g.get("gemini_confidence", 0)) + "%) — "
+        + g.get("gemini_reasoning", "") + "\n"
+        "  Groq " + g.get("groq_vision_model", "Vision") + " → "
+        + str(g.get("groq_vision_vote", "?"))
+        + " (" + str(g.get("groq_vision_confidence", 0)) + "%) — "
+        + g.get("groq_vision_reasoning", "") + "\n\n"
+
+        "══════════════════════════════════════════════════════\n"
+        "  SECTION 2 — REAL-TIME MARKET NEWS (live web search)\n"
+        "══════════════════════════════════════════════════════\n"
+        + news_ctx + "\n"
+        "News Summary (vision AI): " + g.get("news_summary", "N/A") + "\n\n"
+
+        "══════════════════════════════════════════════════════\n"
+        "  SECTION 3 — YOUR ANALYSIS CHECKLIST\n"
+        "══════════════════════════════════════════════════════\n"
+        "Work through each point and summarise your findings in the 'analysis' field:\n\n"
+        "1. TREND STRUCTURE — Is this an uptrend, downtrend, or range? Higher highs/lows?\n"
+        "2. RSI — Is it overbought (>70), oversold (<30), neutral? Any bullish/bearish divergence?\n"
+        "3. MACD — Bullish or bearish crossover? Is the histogram expanding or contracting?\n"
+        "4. SUPPORT / RESISTANCE — Is price near a key level? Is it breaking out or rejecting?\n"
+        "5. VOLUME — Does volume confirm the move? Climax candle, volume dry-up, or spike?\n"
+        "6. PATTERNS — Any reversal (H&S, double top/bottom) or continuation (flag, pennant)?\n"
+        "7. NEWS SENTIMENT — Are the headlines bullish, bearish, or neutral for this asset?\n"
+        "8. SYNTHESIS — Weighing ALL 7 points above: what is the highest-probability move?\n\n"
+        "Return ONLY valid JSON — absolutely no markdown, no extra text:\n"
         '{\n'
         '  "model": "' + model_name + '",\n'
-        '  "analysis": "<2-3 sentence technical + fundamental view>",\n'
-        '  "key_risks": ["<risk 1>", "<risk 2>"],\n'
-        '  "vote": "<UP|DOWN|WAIT>",\n'
-        '  "confidence": <0-100>,\n'
-        '  "reasoning": "<one concise sentence>"\n'
+        '  "analysis": "<rigorous ~4 sentence analysis covering ALL 8 checklist points>",\n'
+        '  "key_risks": ["<precise risk 1>", "<precise risk 2>", "<precise risk 3>"],\n'
+        '  "vote": "UP"|"DOWN"|"WAIT",\n'
+        '  "confidence": 0-100,\n'
+        '  "reasoning": "<single clear sentence: the strongest reason for your vote>",\n'
+        '  "news_sentiment": "BULLISH"|"BEARISH"|"NEUTRAL",\n'
+        '  "technical_score": <integer -100 to 100, negative=bearish, positive=bullish>\n'
         '}'
     )
 
@@ -570,7 +670,7 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
             model=model_id,
             messages=[sys_msg, user_msg],
             temperature=0.4,
-            max_tokens=700,
+            max_tokens=1200,
             response_format={"type": "json_object"},
         )
         raw = chat.choices[0].message.content
@@ -580,7 +680,7 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
             model=model_id,
             messages=[sys_msg, user_msg],
             temperature=0.4,
-            max_tokens=700,
+            max_tokens=1200,
         )
         raw = chat.choices[0].message.content
 
@@ -608,7 +708,7 @@ def _call_deepseek(chart_data: dict) -> dict:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.4,
-            "max_tokens": 700,
+            "max_tokens": 1200,
         },
         timeout=40,
     )
@@ -1185,6 +1285,45 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
             unsafe_allow_html=True,
         )
 
+    # ── Live news banner ──────────────────────────────────────────────────────
+    live_news  = g.get("live_news", [])
+    real_news  = g.get("news_searched", False)
+    if live_news:
+        news_label = (
+            "🌐 Live Market News — " + g.get("asset", "Asset")
+            + " (real-time web search)"
+            if real_news else
+            "📰 Market News — " + g.get("asset", "Asset") + " (AI knowledge)"
+        )
+        st.markdown(
+            "<div class='step-header' style='font-size:.95rem;margin:16px 0 8px;'>"
+            + news_label + "</div>",
+            unsafe_allow_html=True,
+        )
+        news_html = ""
+        for item in live_news[:6]:
+            headline = item.get("headline", "")
+            source   = item.get("source", "")
+            date     = item.get("date", "")
+            news_html += (
+                "<div style='padding:7px 0;border-bottom:1px solid #0d1a2e;'>"
+                "<div style='font-size:.82rem;color:#c0d4e8;font-weight:600;line-height:1.4;'>"
+                + headline + "</div>"
+                "<div style='font-size:.7rem;color:#566880;margin-top:2px;'>"
+                + source + ("  ·  " + date if date else "") + "</div>"
+                "</div>"
+            )
+        st.markdown(
+            "<div class='ai-card' style='padding:12px 16px;'>" + news_html + "</div>",
+            unsafe_allow_html=True,
+        )
+    elif real_news is False:
+        st.markdown(
+            "<p style='font-size:.78rem;color:#2a3a50;font-style:italic;'>"
+            "⚠️ News search unavailable — analysts will use chart data only.</p>",
+            unsafe_allow_html=True,
+        )
+
     # ── Technical analysis detail ─────────────────────────────────────────────
     with st.expander("📊 " + vision + " — Full Technical Analysis + Market News", expanded=False):
         c1, c2, c3 = st.columns(3)
@@ -1214,12 +1353,23 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
             st.markdown("**Patterns:** " + " · ".join(f"`{p}`" for p in g["patterns"]))
 
         st.markdown("---")
-        st.markdown("**📰 Market News**")
+        real_news = g.get("news_searched", False)
+        st.markdown(
+            "**📰 " + ("Live Web News (DuckDuckGo)" if real_news else "Market News (AI knowledge)") + "**"
+        )
         for item in g.get("live_news", []):
-            sent = item.get("sentiment", "Neutral")
-            dot  = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
-            st.markdown(dot + " **" + item.get("headline", "") + "**  \n*" + item.get("source", "") + "*")
-        st.markdown("**News Summary:** " + g.get("news_summary", ""))
+            headline = item.get("headline", "")
+            source   = item.get("source", "")
+            date     = item.get("date", "")
+            body     = item.get("body", "")
+            sent     = item.get("sentiment", "Neutral")
+            dot      = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
+            date_str = f" · {date}" if date else ""
+            st.markdown(dot + " **" + headline + "**  \n"
+                        + f"*{source}{date_str}*"
+                        + (f"  \n{body}" if body else ""))
+        if not real_news:
+            st.markdown("**News Summary:** " + g.get("news_summary", ""))
 
 
 def _platform_badge(platform: str) -> str:
@@ -1704,6 +1854,10 @@ st.markdown("<div class='step-header'>Step 1 — Chart Analysis & Market News</d
             unsafe_allow_html=True)
 with st.spinner("🔍 Reading chart…  Gemini primary → Groq vision fallback…"):
     chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
+
+asset_name = chart_data.get("asset", "asset")
+with st.spinner("🌐 Searching latest market news for " + asset_name + "…"):
+    chart_data = _inject_real_news(chart_data)
 
 render_chart_analysis(chart_data, vision_status)
 
