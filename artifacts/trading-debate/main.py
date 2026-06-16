@@ -323,6 +323,61 @@ def _groq_vision(image_bytes: bytes, mime: str, extra: str,
     return result
 
 
+def _gemini_text_vote(chart_data: dict) -> dict:
+    """
+    When Gemini vision is rate-limited (429), call its text API instead.
+    It reads the chart analysis extracted by Groq's vision model and casts
+    an independent UP/DOWN/WAIT vote based on that structured text data.
+    Returns {"vote": ..., "confidence": ..., "reasoning": ...}.
+    """
+    import google.generativeai as genai
+
+    support    = ", ".join(chart_data.get("support", []))
+    resistance = ", ".join(chart_data.get("resistance", []))
+    indicators = "; ".join(
+        f"{k}: {v}" for k, v in chart_data.get("indicators", {}).items()
+    )
+    patterns   = ", ".join(chart_data.get("patterns", []))
+    news_lines = "\n".join(
+        "- " + item.get("headline", "") + " [" + item.get("sentiment", "") + "]"
+        for item in chart_data.get("live_news", [])
+    )
+
+    prompt = (
+        "You are a senior technical analyst. A Groq vision AI read a trading chart "
+        "and extracted the structured data below. Your vision API is quota-limited, "
+        "so you must analyze this TEXT data and provide your own independent vote.\n\n"
+        "=== CHART DATA (extracted by Groq Llama-4 Vision) ===\n"
+        "Asset       : " + chart_data.get("asset", "unknown") + "\n"
+        "Timeframe   : " + chart_data.get("timeframe", "unknown") + "\n"
+        "Trend       : " + chart_data.get("trend", "unknown") + "\n"
+        "Support     : " + support + "\n"
+        "Resistance  : " + resistance + "\n"
+        "Indicators  : " + indicators + "\n"
+        "Patterns    : " + patterns + "\n"
+        "Summary     : " + chart_data.get("technical_summary", "") + "\n"
+        "Market News :\n" + news_lines + "\n"
+        "News Summary: " + chart_data.get("news_summary", "") + "\n"
+        "Groq Vote   : " + chart_data.get("groq_vision_vote", "?")
+        + " (" + str(chart_data.get("groq_vision_confidence", 0)) + "%)\n"
+        "Groq Says   : " + chart_data.get("groq_vision_reasoning", "") + "\n"
+        "====================================================\n\n"
+        "Analyze the above data independently and provide your directional vote. "
+        "Do NOT just agree with Groq — form your own view.\n\n"
+        "Respond with valid JSON only:\n"
+        '{"vote": "UP"|"DOWN"|"WAIT", "confidence": 0-100, "reasoning": "one sentence"}'
+    )
+
+    genai.configure(api_key=require_secret("GEMINI_API_KEY"))
+    model    = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    result   = parse_json(response.text)
+    result.setdefault("vote",       "WAIT")
+    result.setdefault("confidence", 50)
+    result.setdefault("reasoning",  "Based on Groq Llama-4 vision analysis.")
+    return result
+
+
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
     Runs BOTH Gemini AND Groq vision — each always gets its own committee vote.
@@ -381,17 +436,33 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 
     elif groq_data:
         chart_data = groq_data                              # Groq = primary analysis
-        chart_data["gemini_vote"]            = "Offline"
-        chart_data["gemini_confidence"]      = 0
-        chart_data["gemini_reasoning"]       = "Gemini offline — " + gemini_error[:120]
         chart_data["groq_vision_model"]      = groq_model_used
         chart_data["groq_vision_vote"]       = groq_data.get("vote", "WAIT")
         chart_data["groq_vision_confidence"] = groq_data.get("confidence", 50)
         chart_data["groq_vision_reasoning"]  = groq_data.get("reasoning", "")
-        status = (
-            "⚠️ Gemini offline (" + gemini_error[:120] + "). "
-            "**" + groq_model_used + "** (Groq vision) completed the analysis."
-        )
+
+        # ── Gemini text fallback: read Groq's extracted analysis via text API ─
+        is_quota_err = "429" in gemini_error or "quota" in gemini_error.lower() or "resource" in gemini_error.lower()
+        try:
+            gem_text = _gemini_text_vote(chart_data)
+            chart_data["gemini_vote"]       = gem_text.get("vote", "WAIT")
+            chart_data["gemini_confidence"] = gem_text.get("confidence", 50)
+            chart_data["gemini_reasoning"]  = gem_text.get("reasoning", "")
+            chart_data["gemini_mode"]       = "text"
+            status = (
+                "⚠️ Gemini vision quota hit — switched to **text mode**. "
+                "Groq **" + groq_model_used + "** read the chart; "
+                "Gemini analyzed the extracted data via text API."
+            )
+        except Exception as tex:
+            chart_data["gemini_vote"]       = "Offline"
+            chart_data["gemini_confidence"] = 0
+            chart_data["gemini_reasoning"]  = "Gemini offline — " + gemini_error[:120]
+            chart_data["gemini_mode"]       = "offline"
+            status = (
+                "⚠️ Gemini offline (" + gemini_error[:120] + "). "
+                "**" + groq_model_used + "** (Groq vision) completed the analysis."
+            )
 
     else:
         chart_data = dict(_TEXT_FALLBACK_DATA)
@@ -827,21 +898,29 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
     )
     vcol1, vcol2 = st.columns(2)
 
-    gv   = g.get("gemini_vote", "WAIT")
-    gc   = g.get("gemini_confidence", 0)
-    g_ok = gv not in ("Offline", "WAIT", "")
+    gv         = g.get("gemini_vote", "WAIT")
+    gc         = g.get("gemini_confidence", 0)
+    gemini_mode = g.get("gemini_mode", "vision")   # "vision" | "text" | "offline"
+    mode_label  = (
+        "<span style='font-size:.7rem;color:#f0a500;background:#2a1e00;"
+        "border-radius:4px;padding:1px 6px;margin-left:6px;'>📄 Text Mode</span>"
+        if gemini_mode == "text" else ""
+    )
     with vcol1:
         g_color = _NEON.get(gv, "#555")
         st.markdown(
             "<div class='ai-card' style='border-color:" + g_color + "44;text-align:center;'>"
-            "<div style='margin-bottom:6px;'>" + _platform_badge("Gemini") + "</div>"
+            "<div style='margin-bottom:6px;'>" + _platform_badge("Gemini") + mode_label + "</div>"
             "<div style='font-size:.85rem;color:#8090a8;margin-bottom:4px;'>Gemini 2.0 Flash</div>"
             "<div style='font-size:2rem;font-weight:900;color:" + g_color + ";'>"
             + VOTE_ICON.get(gv, "❓") + " " + gv + "</div>"
             "<div style='font-size:.78rem;color:#6a82a0;margin-top:4px;'>" + str(gc) + "% confidence</div>"
             "<div style='font-size:.8rem;color:#a0b4c8;margin-top:8px;font-style:italic;'>"
             + g.get("gemini_reasoning", "") + "</div>"
-            "</div>",
+            + ("<div style='font-size:.7rem;color:#f0a500;margin-top:6px;'>"
+               "👁️ Vision quota hit — voted from Groq's extracted text analysis</div>"
+               if gemini_mode == "text" else "")
+            + "</div>",
             unsafe_allow_html=True,
         )
 
