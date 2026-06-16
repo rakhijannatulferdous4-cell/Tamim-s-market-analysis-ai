@@ -66,24 +66,44 @@ def require_secret(key: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_json(text: str) -> dict:
     raw = text or ""
-    # Strip Qwen / DeepSeek-R1 chain-of-thought blocks
+    # 1. Strip <think>…</think> (Qwen-QwQ / DeepSeek-R1 style)
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # 2. Strip markdown fences
     if "```json" in raw:
         raw = raw.split("```json", 1)[1].split("```", 1)[0]
     elif "```" in raw:
         raw = raw.split("```", 1)[1].split("```", 1)[0]
+    # 3. Extract first {...} block
     start = raw.find("{")
     end   = raw.rfind("}") + 1
-    if start < 0:
-        raise ValueError(f"No JSON object found in response:\n{text[:400]}")
-    return json.loads(raw[start:end])
+    if start >= 0:
+        try:
+            return json.loads(raw[start:end])
+        except Exception:
+            pass
+    # 4. Last-resort text extraction — some models output structured prose
+    #    instead of JSON. Pull vote / confidence / reasoning from keywords.
+    txt_up = text.upper()
+    vote   = "WAIT"
+    if re.search(r'\bBULLISH\b|\b"UP"\b|\bVOTE[:\s]+UP\b|DIRECTION[:\s]+UP', txt_up):
+        vote = "UP"
+    elif re.search(r'\bBEARISH\b|\b"DOWN"\b|\bVOTE[:\s]+DOWN\b|DIRECTION[:\s]+DOWN', txt_up):
+        vote = "DOWN"
+    conf_m = re.search(r'(\d{1,3})\s*%', text)
+    conf   = min(int(conf_m.group(1)), 100) if conf_m else 50
+    lines  = [l.strip() for l in text.split("\n") if len(l.strip()) > 25]
+    rsn    = lines[0][:140] if lines else "Model output could not be parsed as JSON."
+    return {"vote": vote, "confidence": conf, "reasoning": rsn,
+            "_text_extraction": True}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Groq model discovery helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _GROQ_TEXT_EXCLUDE = frozenset(
-    ["vision", "whisper", "guard", "embed", "tts", "distil"]
+    # Exclude non-text, non-chat, and reasoning models that emit plain-text
+    # chain-of-thought instead of JSON (qwq = QwQ, think = thinking variants)
+    ["vision", "whisper", "guard", "embed", "tts", "distil", "qwq", "think"]
 )
 
 # Hard fallback list used when the live API call fails
@@ -537,19 +557,34 @@ def build_analyst_prompt(model_name: str, g: dict) -> str:
 
 def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
     from groq import Groq
-    client = Groq(api_key=require_secret("GROQ_API_KEY"))
-    prompt = build_analyst_prompt(model_name, chart_data)
-    chat = client.chat.completions.create(
-        model=model_id,
-        messages=[
-            {"role": "system",
-             "content": "You are an expert AI trading analyst. Respond with valid JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.4,
-        max_tokens=700,
-    )
-    result = parse_json(chat.choices[0].message.content)
+    client  = Groq(api_key=require_secret("GROQ_API_KEY"))
+    prompt  = build_analyst_prompt(model_name, chart_data)
+    sys_msg = {"role": "system",
+               "content": "You are an expert AI trading analyst. Respond with valid JSON only. No markdown, no explanation — pure JSON."}
+    user_msg = {"role": "user", "content": prompt}
+
+    # Try with response_format=json_object first (forces compliant models to output JSON)
+    raw = None
+    try:
+        chat = client.chat.completions.create(
+            model=model_id,
+            messages=[sys_msg, user_msg],
+            temperature=0.4,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+        )
+        raw = chat.choices[0].message.content
+    except Exception:
+        # Model doesn't support response_format — fall back to plain call
+        chat = client.chat.completions.create(
+            model=model_id,
+            messages=[sys_msg, user_msg],
+            temperature=0.4,
+            max_tokens=700,
+        )
+        raw = chat.choices[0].message.content
+
+    result = parse_json(raw)
     result.setdefault("model", model_name)
     result["_platform"] = "Groq"
     return result
@@ -718,87 +753,131 @@ _NEON = {
 
 _PREMIUM_CSS = """
 <style>
+/* ── Google Font ────────────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+
+/* ── Animated mesh background ───────────────────────────────────────── */
+@keyframes meshMove {
+    0%   { transform: translateY(0px)   rotate(0deg);   opacity:.025; }
+    50%  { transform: translateY(-28px) rotate(6deg);   opacity:.055; }
+    100% { transform: translateY(0px)   rotate(0deg);   opacity:.025; }
+}
+@keyframes fadeUp {
+    from { opacity:0; transform:translateY(16px); }
+    to   { opacity:1; transform:translateY(0);    }
+}
+@keyframes btnPulse {
+    0%,100% { box-shadow: 0 0 0   0   rgba(0,180,255,.55); }
+    50%     { box-shadow: 0 0 0  14px rgba(0,180,255,0);   }
+}
+@keyframes voteGlow {
+    0%,100% { filter: brightness(1)   drop-shadow(0 0 4px  currentColor); }
+    50%     { filter: brightness(1.3) drop-shadow(0 0 14px currentColor); }
+}
+@keyframes scanLine {
+    0%   { top: -2px; }
+    100% { top: 100%; }
+}
+
 /* ── Base dark theme ────────────────────────────────────────────────── */
 html, body, [data-testid="stAppViewContainer"] {
-    background: #080c17 !important;
+    background: #05080f !important;
     color: #c8d6e8;
     font-family: 'Inter', 'Segoe UI', sans-serif;
 }
 [data-testid="stHeader"],
 [data-testid="stToolbar"]    { background: transparent !important; }
-[data-testid="stSidebar"]    { background: #0a0f1e !important;
-                                border-right: 1px solid #1a2340; }
+[data-testid="stSidebar"]    {
+    background: linear-gradient(180deg, #080c1a 0%, #060910 100%) !important;
+    border-right: 1px solid #1a2340;
+}
 [data-testid="stMain"] > div { padding-top: 1rem; }
-
 hr { border-color: #1a2340 !important; }
 
 /* ── Metrics ────────────────────────────────────────────────────────── */
 [data-testid="metric-container"] {
-    background: #0d1220; border: 1px solid #1a2340;
-    border-radius: 10px; padding: 10px 14px;
+    background: linear-gradient(135deg,#0d1220,#0a0f1c);
+    border: 1px solid #1a2340; border-radius: 10px; padding: 10px 14px;
+    transition: border-color .25s;
 }
+[data-testid="metric-container"]:hover { border-color: #00b4ff44; }
 
 /* ── File uploader ──────────────────────────────────────────────────── */
 [data-testid="stFileUploader"] {
-    background: #0d1220; border: 2px dashed #1a3560;
-    border-radius: 12px; padding: 8px;
+    background: #0a0f1c; border: 2px dashed #1a3560;
+    border-radius: 14px; padding: 8px; transition: border-color .25s;
 }
 [data-testid="stFileUploader"]:hover { border-color: #00b4ff; }
 
 /* ── Text inputs & areas ────────────────────────────────────────────── */
 textarea, input[type="text"] {
-    background: #0d1220 !important; color: #c8d6e8 !important;
+    background: #0a0f1c !important; color: #c8d6e8 !important;
     border: 1px solid #1a2340 !important; border-radius: 10px !important;
+    transition: border-color .2s !important;
 }
 textarea:focus, input[type="text"]:focus { border-color: #00b4ff !important; }
 
 /* ── Expanders ──────────────────────────────────────────────────────── */
 [data-testid="stExpander"] {
-    background: #0d1220 !important;
-    border: 1px solid #1a2340 !important;
+    background: #0a0f1c !important; border: 1px solid #1a2340 !important;
     border-radius: 12px !important;
 }
 
-/* ── Primary button — electric-blue pulse ───────────────────────────── */
+/* ── Primary button ─────────────────────────────────────────────────── */
 [data-testid="baseButton-primary"] {
-    background: linear-gradient(135deg, #0057ff, #00b4ff) !important;
+    background: linear-gradient(135deg, #0044dd, #00b4ff) !important;
     color: #fff !important; border: none !important;
-    border-radius: 10px !important; font-weight: 700 !important;
-    letter-spacing: .04em !important;
+    border-radius: 10px !important; font-weight: 800 !important;
+    letter-spacing: .05em !important;
     animation: btnPulse 2.4s ease-in-out infinite;
+    transition: transform .15s, box-shadow .15s !important;
 }
 [data-testid="baseButton-primary"]:hover {
-    background: linear-gradient(135deg, #0070ff, #33c6ff) !important;
-    box-shadow: 0 0 22px #00b4ff88 !important; animation: none;
-}
-@keyframes btnPulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(0,180,255,.55); }
-    50%       { box-shadow: 0 0 0 14px rgba(0,180,255,0); }
+    background: linear-gradient(135deg, #0060ff, #33ccff) !important;
+    box-shadow: 0 0 28px #00b4ffaa !important;
+    transform: translateY(-2px) !important;
+    animation: none;
 }
 
-/* ── Secondary buttons (sidebar) ────────────────────────────────────── */
+/* ── Secondary buttons ──────────────────────────────────────────────── */
 [data-testid="baseButton-secondary"] {
-    background: #12192e !important; color: #a0b8d0 !important;
+    background: #101828 !important; color: #a0b8d0 !important;
     border: 1px solid #1e3050 !important; border-radius: 8px !important;
+    transition: border-color .2s, color .2s !important;
 }
 [data-testid="baseButton-secondary"]:hover {
     border-color: #00b4ff !important; color: #00b4ff !important;
 }
 
-/* ── Analyst cards — fade-in ────────────────────────────────────────── */
-@keyframes fadeUp {
-    from { opacity: 0; transform: translateY(14px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
+/* ── AI analyst cards ───────────────────────────────────────────────── */
 .ai-card {
-    background: #0d1220; border: 1px solid #1a2340;
-    border-radius: 14px; padding: 18px 20px 14px; margin: 10px 0;
+    background: linear-gradient(135deg, #0d1220 0%, #0a101e 100%);
+    border: 1px solid #1a2340;
+    border-radius: 16px; padding: 18px 20px 14px; margin: 10px 0;
     animation: fadeUp .55s ease both;
-    box-shadow: 0 4px 24px rgba(0,0,0,.45);
+    box-shadow: 0 4px 24px rgba(0,0,0,.5);
+    /* 3D perspective */
+    perspective: 900px;
+    transition: transform .35s cubic-bezier(.25,.46,.45,.94),
+                box-shadow .35s ease,
+                border-color .3s ease;
+    position: relative; overflow: hidden;
 }
-.ai-card:hover { border-color: #00b4ff44;
-                  box-shadow: 0 4px 28px rgba(0,180,255,.12); }
-.ai-card.offline { border-color: #ff386035; opacity: .75; }
+/* Subtle scan-line shimmer on hover */
+.ai-card::after {
+    content:''; position:absolute; left:0; top:-2px;
+    width:100%; height:2px;
+    background: linear-gradient(90deg,transparent,#00b4ff55,transparent);
+    opacity:0; transition:opacity .3s;
+}
+.ai-card:hover {
+    transform: translateY(-6px) rotateX(2.5deg) rotateY(-1deg);
+    box-shadow: 0 18px 50px rgba(0,180,255,.18),
+                0 6px 16px rgba(0,0,0,.6);
+    border-color: #00b4ff44 !important;
+}
+.ai-card:hover::after { opacity:1; animation: scanLine 1.4s linear infinite; }
+.ai-card.offline { border-color: #ff386028; opacity:.72; }
 
 .card-row { display:flex; align-items:center; gap:10px;
             flex-wrap:wrap; margin-bottom:10px; }
@@ -809,58 +888,90 @@ textarea:focus, input[type="text"]:focus { border-color: #00b4ff !important; }
 .analysis-txt { font-size:.88rem; color:#a8bcd4; line-height:1.6; margin:6px 0; }
 .risks-row  { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 4px; }
 .risk-tag   { font-size:.74rem; padding:3px 9px; border-radius:6px;
-              background:#12192e; border:1px solid #1e2f50; color:#7a9abf; }
+              background:#0e1526; border:1px solid #1e2f50; color:#7a9abf; }
 .reasoning-txt { font-size:.83rem; color:#5e7a9a; font-style:italic; margin-top:6px; }
 .err-txt    { font-size:.82rem; color:#ff6080; margin-top:6px; }
 
 /* ── Scoreboard tiles ───────────────────────────────────────────────── */
 .sb-tile {
-    background: #0d1220; border: 1.5px solid #1a2340;
-    border-radius: 10px; padding: 10px 6px; text-align: center;
+    background: linear-gradient(160deg,#0d1220,#0a101e);
+    border: 1.5px solid #1a2340; border-radius: 12px;
+    padding: 10px 6px; text-align: center;
     animation: fadeUp .5s ease both;
+    transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+    cursor: default;
 }
-.sb-tile:hover { border-color: #00b4ff44; }
+.sb-tile:hover {
+    transform: translateY(-4px) scale(1.04);
+    box-shadow: 0 10px 30px rgba(0,180,255,.15);
+    border-color: #00b4ff55;
+}
 .sb-model-lbl { font-size:.65rem; color:#566880; margin-bottom:4px; }
 .sb-vote-icon { font-size:1.4rem; }
-.sb-vote-txt  { font-size:.88rem; font-weight:800; }
+.sb-vote-txt  { font-size:.88rem; font-weight:800;
+                animation: voteGlow 3s ease-in-out infinite; }
 .sb-conf-txt  { font-size:.65rem; color:#566880; margin-top:2px; }
 
 /* ── Final verdict banner ───────────────────────────────────────────── */
-.verdict-banner { text-align:center; padding:28px 0 12px;
-                   animation: fadeUp .6s ease both; }
-.verdict-word { font-size:4.8rem; font-weight:900; line-height:1; }
-.verdict-sub  { font-size:1rem; color:#6a82a0; margin-top:6px; }
+.verdict-banner {
+    text-align:center; padding:32px 0 14px;
+    animation: fadeUp .6s ease both;
+}
+.verdict-word {
+    font-size:5rem; font-weight:900; line-height:1;
+    animation: voteGlow 2.5s ease-in-out infinite;
+}
+.verdict-sub  { font-size:1rem; color:#6a82a0; margin-top:8px; }
 
 /* ── Trade boxes ────────────────────────────────────────────────────── */
-.trade-box { border-radius:16px; padding:32px 28px; margin:10px 0;
-             text-align:center; animation: fadeUp .6s ease both; }
-.trade-arrow { font-size:2.6rem; }
-.trade-txt   { font-size:1.45rem; font-weight:900;
-               letter-spacing:.025em; line-height:1.55; margin-top:10px; }
+.trade-box {
+    border-radius: 18px; padding: 34px 28px; margin:10px 0;
+    text-align:center; animation: fadeUp .6s ease both;
+    position: relative; overflow:hidden;
+}
+.trade-box::before {
+    content:''; position:absolute; inset:0;
+    background: radial-gradient(ellipse at 50% 0%, rgba(255,255,255,.04), transparent 70%);
+    pointer-events:none;
+}
+.trade-arrow { font-size:2.8rem; }
+.trade-txt   { font-size:1.5rem; font-weight:900;
+               letter-spacing:.03em; line-height:1.55; margin-top:10px; }
 
 /* ── Step headers ───────────────────────────────────────────────────── */
 .step-header {
     display:flex; align-items:center; gap:10px;
     font-size:1.2rem; font-weight:700; color:#c8d6e8;
-    border-left:3px solid #00b4ff; padding-left:12px; margin:24px 0 10px;
+    border-left: 3px solid;
+    border-image: linear-gradient(180deg,#00b4ff,#00ff88) 1;
+    padding-left:12px; margin:24px 0 10px;
 }
 
-/* ── Platform badges (Groq / DeepSeek / Gemini) ─────────────────────── */
+/* ── Platform badges ─────────────────────────────────────────────────── */
 .platform-badge {
     font-size:.65rem; font-weight:800; padding:2px 7px;
     border-radius:5px; letter-spacing:.06em; vertical-align:middle;
+    display:inline-block;
 }
-.platform-groq    { background:#1a2e10; color:#6ee73a; border:1px solid #4aaa1a; }
-.platform-deepseek{ background:#0d1f3c; color:#60a5fa; border:1px solid #3b82f6; }
-.platform-gemini  { background:#1e0d38; color:#c084fc; border:1px solid #9333ea; }
-.platform-custom  { background:#1a1a2e; color:#94a3b8; border:1px solid #475569; }
+.platform-groq    { background:#0f2008; color:#6ee73a; border:1px solid #3a8810; }
+.platform-deepseek{ background:#080f28; color:#60a5fa; border:1px solid #2e5fd4; }
+.platform-gemini  { background:#130828; color:#c084fc; border:1px solid #7c22d0; }
+.platform-custom  { background:#101018; color:#94a3b8; border:1px solid #3a4060; }
 
 /* ── Sidebar model tags ─────────────────────────────────────────────── */
 .custom-model-tag {
     display:inline-flex; align-items:center; gap:6px;
-    background:#12192e; border:1px solid #1e3050; border-radius:8px;
-    padding:4px 10px; margin:4px 0; font-size:.8rem; color:#7a9abf;
-    width:100%;
+    background:#0d1424; border:1px solid #1e3050; border-radius:8px;
+    padding:4px 10px; margin:3px 0; font-size:.8rem; color:#7a9abf;
+    width:100%; transition: border-color .2s;
+}
+.custom-model-tag:hover { border-color: #00b4ff44; }
+
+/* ── Catalog model row ──────────────────────────────────────────────── */
+.catalog-row {
+    display:flex; align-items:center; justify-content:space-between;
+    background:#0a0f1c; border:1px solid #1a2340; border-radius:8px;
+    padding:5px 10px; margin:3px 0; font-size:.78rem; color:#7a9abf;
 }
 </style>
 """
@@ -1182,19 +1293,79 @@ with st.sidebar:
     st.markdown(
         "<h2 style='font-size:1.1rem;font-weight:800;color:#c8d6e8;"
         "border-bottom:1px solid #1a2340;padding-bottom:8px;margin-bottom:12px;'>"
-        "🧩 Custom Model Manager</h2>",
+        "🧩 AI Model Manager</h2>",
         unsafe_allow_html=True,
     )
+
+    # ── Section 1: Live catalog browser ───────────────────────────────
     st.markdown(
-        "<p style='font-size:.8rem;color:#566880;margin-bottom:10px;'>"
-        "Add any live Groq model ID to include it in the voting committee.</p>",
+        "<p style='font-size:.75rem;font-weight:700;color:#8090a8;"
+        "text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;'>"
+        "⚡ Live Groq Catalog</p>",
+        unsafe_allow_html=True,
+    )
+
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _get_full_catalog() -> list[tuple[str, str]]:
+        return _discover_groq_text_models(n=12)
+
+    catalog   = _get_full_catalog()
+    catalog_ids  = [mid for mid, _ in catalog]
+    auto_ids     = catalog_ids[:3]
+    already_custom = st.session_state.get("custom_models", [])
+    addable      = [mid for mid in catalog_ids
+                    if mid not in auto_ids and mid not in already_custom]
+
+    for mid in auto_ids:
+        st.markdown(
+            "<div class='catalog-row'>"
+            "<span style='color:#00ff88;font-size:.8rem;'>✅</span>"
+            "<span style='flex:1;margin:0 6px;font-size:.78rem;color:#a0b8d0;'>"
+            + _short_label(mid) + "</span>"
+            "<span style='font-size:.6rem;color:#2a5040;background:#0a1e14;"
+            "padding:1px 5px;border-radius:4px;'>AUTO</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        "<p style='font-size:.68rem;color:#2a3a50;margin:4px 0 0;'>"
+        "🔄 Auto-refreshed every 2 min from Groq's live API</p>",
+        unsafe_allow_html=True,
+    )
+
+    # Quick-add from remaining discovered models
+    if addable:
+        st.markdown(
+            "<p style='font-size:.75rem;font-weight:700;color:#8090a8;"
+            "text-transform:uppercase;letter-spacing:.06em;margin:12px 0 4px;'>"
+            "➕ Quick-Add from Catalog</p>",
+            unsafe_allow_html=True,
+        )
+        quick_pick = st.selectbox(
+            "pick_model",
+            ["— choose a model —"] + [_short_label(m) + "  |  " + m for m in addable],
+            label_visibility="collapsed",
+        )
+        if st.button("Add Selected ➕", use_container_width=True):
+            if quick_pick and "—" not in quick_pick:
+                picked_id = quick_pick.split("  |  ")[-1].strip()
+                if picked_id not in st.session_state["custom_models"]:
+                    st.session_state["custom_models"].append(picked_id)
+                    st.rerun()
+
+    # ── Section 2: Manual model ID entry ──────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        "<p style='font-size:.75rem;font-weight:700;color:#8090a8;"
+        "text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;'>"
+        "🤖 Add Any Model Manually</p>",
         unsafe_allow_html=True,
     )
 
     custom_input = st.text_input(
         "Groq Model ID",
         key="custom_model_input",
-        placeholder="e.g. qwen-qwq-32b",
+        placeholder="e.g. meta-llama/llama-4-maverick…",
         label_visibility="collapsed",
     )
     if st.button("➕ Add to Committee", use_container_width=True):
@@ -1203,16 +1374,17 @@ with st.sidebar:
             st.session_state["custom_models"].append(cid)
             st.rerun()
 
+    # ── Section 3: Active custom models ───────────────────────────────
     if st.session_state["custom_models"]:
         st.markdown(
             "<p style='font-size:.75rem;color:#566880;margin:10px 0 4px;'>"
-            "Active custom analysts:</p>",
+            "Your custom analysts:</p>",
             unsafe_allow_html=True,
         )
         for i, mid in enumerate(list(st.session_state["custom_models"])):
             c1, c2 = st.columns([5, 1])
             c1.markdown(
-                "<div class='custom-model-tag'>🤖 " + mid + "</div>",
+                "<div class='custom-model-tag'>🤖 " + _short_label(mid) + "</div>",
                 unsafe_allow_html=True,
             )
             if c2.button("✕", key="rm_" + str(i), help="Remove"):
@@ -1220,17 +1392,16 @@ with st.sidebar:
                 st.rerun()
     else:
         st.markdown(
-            "<p style='font-size:.78rem;color:#2a3a50;font-style:italic;margin-top:8px;'>"
-            "No custom models yet.</p>",
+            "<p style='font-size:.78rem;color:#1e2e40;font-style:italic;margin-top:8px;'>"
+            "No custom models added yet.</p>",
             unsafe_allow_html=True,
         )
 
     st.markdown("---")
     st.markdown(
-        "<p style='font-size:.72rem;color:#2a3a50;'>"
-        "Tip: paste an exact model ID from Groq's console.<br>"
-        "Examples: <code>qwen-qwq-32b</code>, "
-        "<code>meta-llama/llama-4-scout-17b-16e-instruct</code></p>",
+        "<p style='font-size:.7rem;color:#1e2e40;'>"
+        "Gemini 2.0 Flash &amp; DeepSeek-Chat always participate automatically.<br>"
+        "All added models use the same JSON vote rules.</p>",
         unsafe_allow_html=True,
     )
 
