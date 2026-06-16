@@ -313,60 +313,101 @@ def _groq_vision(image_bytes: bytes, mime: str, extra: str,
     )
     result = parse_json(response.choices[0].message.content)
     result["vision_model"] = model_label
-    result.setdefault("gemini_vote",       result.get("vote", "WAIT"))
-    result.setdefault("gemini_confidence", result.get("confidence", 50))
-    result.setdefault("gemini_reasoning",  result.get("reasoning", "Groq vision fallback."))
+    # Normalise — model may return "vote" or "gemini_vote"; expose both consistently
+    vote = result.get("vote") or result.get("gemini_vote") or "WAIT"
+    conf = result.get("confidence") or result.get("gemini_confidence") or 50
+    rsn  = result.get("reasoning") or result.get("gemini_reasoning") or "Groq vision analysis."
+    result["vote"]       = vote
+    result["confidence"] = conf
+    result["reasoning"]  = rsn
     return result
 
 
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
+    Runs BOTH Gemini AND Groq vision — each always gets its own committee vote.
     Returns (chart_data, status_message). Never raises.
 
-    Chain:
-    1. Gemini 2.0 Flash (stable SDK) — single shot, instant fallback on ANY error.
-    2. Groq vision — tries seeded candidates + live catalog discovery in order.
-    3. Text fallback — debate still runs with high-volatility context.
+    chart_data fields added:
+        gemini_vote / gemini_confidence / gemini_reasoning   — Gemini's slot
+        groq_vision_model / groq_vision_vote /               — Groq's slot
+        groq_vision_confidence / groq_vision_reasoning
+
+    Primary technical analysis (support, resistance, etc.) comes from
+    Gemini when online; otherwise from the best available Groq vision model.
     """
-    # ── 1. Gemini — single attempt ────────────────────────────────────────────
+    # ── 1. Try Gemini ─────────────────────────────────────────────────────────
+    gemini_data  = None
     gemini_error = ""
     try:
-        data = _gemini_vision(image_bytes, extra)
-        return data, "✨ Gemini 2.0 Flash — chart analysis complete."
+        gemini_data = _gemini_vision(image_bytes, extra)
     except Exception as exc:
         gemini_error = f"{type(exc).__name__}: {str(exc)[:220]}"
 
-    # ── 2. Groq vision — ordered queue (seeds + live discovery) ──────────────
-    vision_queue = _discover_groq_vision_models()
-    groq_errors: list[str] = []
-
-    for model_id in vision_queue:
+    # ── 2. Try best available Groq vision model ───────────────────────────────
+    groq_data       = None
+    groq_error      = ""
+    groq_model_used = ""
+    for model_id in _discover_groq_vision_models():
         try:
-            data = _groq_vision(image_bytes, mime, extra, model_id, model_id)
-            # Stamp Gemini's committee slot as Offline
-            data.setdefault("gemini_vote",       "Offline")
-            data.setdefault("gemini_confidence", 0)
-            data.setdefault("gemini_reasoning",
-                            f"Gemini temporarily offline — {gemini_error[:100]}")
-            return data, (
-                f"⚠️ Gemini offline ({gemini_error[:160]}). "
-                f"Fell back to **{model_id}** (Groq vision) — analysis complete."
-            )
+            groq_data       = _groq_vision(image_bytes, mime, extra, model_id, model_id)
+            groq_model_used = model_id
+            break
         except Exception as exc:
-            groq_errors.append(f"{model_id}: {type(exc).__name__}: {str(exc)[:80]}")
+            groq_error += f"{model_id}: {str(exc)[:60]}; "
 
-    # ── 3. Text fallback — debate continues regardless ────────────────────────
-    all_errs = f"Gemini: {gemini_error} || Groq: {' | '.join(groq_errors)}"
-    status = (
-        "🚨 **All vision APIs failed** — running in text-fallback mode.\n\n"
-        f"Errors: {all_errs[:350]}\n\n"
-        "The AI committee will debate using a **highly volatile / high-risk** "
-        "context. Chart-specific signals will not be available."
-    )
-    fallback = dict(_TEXT_FALLBACK_DATA)
-    if extra.strip():
-        fallback["technical_summary"] += f"  User context: {extra.strip()}"
-    return fallback, status
+    # ── 3. Merge both results ─────────────────────────────────────────────────
+    if gemini_data and groq_data:
+        chart_data = gemini_data                            # Gemini = primary analysis
+        chart_data["groq_vision_model"]      = groq_model_used
+        chart_data["groq_vision_vote"]       = groq_data.get("vote", "WAIT")
+        chart_data["groq_vision_confidence"] = groq_data.get("confidence", 50)
+        chart_data["groq_vision_reasoning"]  = groq_data.get("reasoning", "")
+        status = (
+            "✅ **Gemini 2.0 Flash** ✨ AND **"
+            + groq_model_used + "** ⚡ both analyzed the chart."
+        )
+
+    elif gemini_data:
+        chart_data = gemini_data
+        chart_data["groq_vision_model"]      = "Groq Vision"
+        chart_data["groq_vision_vote"]       = "Offline"
+        chart_data["groq_vision_confidence"] = 0
+        chart_data["groq_vision_reasoning"]  = "Groq vision unavailable — " + groq_error[:100]
+        status = (
+            "⚠️ Groq vision offline. "
+            "**Gemini 2.0 Flash** completed the chart analysis."
+        )
+
+    elif groq_data:
+        chart_data = groq_data                              # Groq = primary analysis
+        chart_data["gemini_vote"]            = "Offline"
+        chart_data["gemini_confidence"]      = 0
+        chart_data["gemini_reasoning"]       = "Gemini offline — " + gemini_error[:120]
+        chart_data["groq_vision_model"]      = groq_model_used
+        chart_data["groq_vision_vote"]       = groq_data.get("vote", "WAIT")
+        chart_data["groq_vision_confidence"] = groq_data.get("confidence", 50)
+        chart_data["groq_vision_reasoning"]  = groq_data.get("reasoning", "")
+        status = (
+            "⚠️ Gemini offline (" + gemini_error[:120] + "). "
+            "**" + groq_model_used + "** (Groq vision) completed the analysis."
+        )
+
+    else:
+        chart_data = dict(_TEXT_FALLBACK_DATA)
+        if extra.strip():
+            chart_data["technical_summary"] += "  User context: " + extra.strip()
+        chart_data["groq_vision_model"]      = "Groq Vision"
+        chart_data["groq_vision_vote"]       = "Offline"
+        chart_data["groq_vision_confidence"] = 0
+        chart_data["groq_vision_reasoning"]  = "All vision APIs failed."
+        all_errs = "Gemini: " + gemini_error + " | Groq: " + groq_error
+        status = (
+            "🚨 **All vision APIs failed** — text-fallback mode.\n\n"
+            "Errors: " + all_errs[:300]
+        )
+
+    return chart_data, status
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,9 +441,13 @@ def build_analyst_prompt(model_name: str, g: dict) -> str:
         "Indicators   : " + indicators + "\n"
         "Patterns     : " + ", ".join(g.get("patterns", [])) + "\n"
         "Summary      : " + g.get("technical_summary", "") + "\n"
-        "Vision Vote  : " + str(g.get("gemini_vote", "?"))
+        "Gemini Vote  : " + str(g.get("gemini_vote", "?"))
         + " (" + str(g.get("gemini_confidence", 0)) + "%)\n"
-        "Vision Says  : " + g.get("gemini_reasoning", "") + "\n\n"
+        "Gemini Says  : " + g.get("gemini_reasoning", "") + "\n"
+        "Groq Vision  : " + str(g.get("groq_vision_vote", "?"))
+        + " (" + str(g.get("groq_vision_confidence", 0)) + "%) via "
+        + g.get("groq_vision_model", "Groq") + "\n"
+        "Groq Says    : " + g.get("groq_vision_reasoning", "") + "\n\n"
         "=== MARKET NEWS ===\n"
         + news_lines + "\n"
         "Summary: " + g.get("news_summary", "") + "\n"
@@ -480,10 +525,14 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
     tf_minutes = chart_data.get("timeframe_minutes", 0)
 
     positions = (
-        "Vision Model (" + chart_data.get("vision_model", "?") + "): "
+        "Gemini 2.0 Flash (Vision): "
         + chart_data.get("gemini_vote", "WAIT")
         + " (" + str(chart_data.get("gemini_confidence", 0)) + "%) — "
         + chart_data.get("gemini_reasoning", "") + "\n"
+        + chart_data.get("groq_vision_model", "Groq Vision") + " (Vision): "
+        + chart_data.get("groq_vision_vote", "WAIT")
+        + " (" + str(chart_data.get("groq_vision_confidence", 0)) + "%) — "
+        + chart_data.get("groq_vision_reasoning", "") + "\n"
     )
     for v in analyst_votes:
         positions += (
@@ -494,9 +543,10 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
             + "  Key Risks : " + ", ".join(v.get("key_risks", [])) + "\n"
         )
 
-    online_names = [chart_data.get("vision_model", "Vision")] + [
-        v.get("model", "?") for v in analyst_votes
-    ]
+    online_names = (
+        ["Gemini 2.0 Flash", chart_data.get("groq_vision_model", "Groq Vision")]
+        + [v.get("model", "?") for v in analyst_votes]
+    )
 
     return (
         "You are the debate moderator for an AI trading analyst panel.\n\n"
@@ -761,7 +811,6 @@ def _model_icon(name: str) -> str:
 
 def render_chart_analysis(g: dict, status_msg: str) -> None:
     vision = g.get("vision_model", "Vision Model")
-    icon   = _model_icon(vision)
 
     is_warn = any(w in status_msg.lower()
                   for w in ("fallback", "unavailable", "failed", "offline"))
@@ -770,15 +819,56 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
     else:
         st.success(status_msg)
 
-    with st.expander(f"{icon} {vision} — Chart Analysis + Market News", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
+    # ── Vision votes side-by-side ─────────────────────────────────────────────
+    st.markdown(
+        "<div class='step-header' style='font-size:1rem;margin:12px 0 8px;'>"
+        "👁️ Vision Committee — Both AIs Read the Chart</div>",
+        unsafe_allow_html=True,
+    )
+    vcol1, vcol2 = st.columns(2)
+
+    gv   = g.get("gemini_vote", "WAIT")
+    gc   = g.get("gemini_confidence", 0)
+    g_ok = gv not in ("Offline", "WAIT", "")
+    with vcol1:
+        g_color = _NEON.get(gv, "#555")
+        st.markdown(
+            "<div class='ai-card' style='border-color:" + g_color + "44;text-align:center;'>"
+            "<div style='margin-bottom:6px;'>" + _platform_badge("Gemini") + "</div>"
+            "<div style='font-size:.85rem;color:#8090a8;margin-bottom:4px;'>Gemini 2.0 Flash</div>"
+            "<div style='font-size:2rem;font-weight:900;color:" + g_color + ";'>"
+            + VOTE_ICON.get(gv, "❓") + " " + gv + "</div>"
+            "<div style='font-size:.78rem;color:#6a82a0;margin-top:4px;'>" + str(gc) + "% confidence</div>"
+            "<div style='font-size:.8rem;color:#a0b4c8;margin-top:8px;font-style:italic;'>"
+            + g.get("gemini_reasoning", "") + "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    grv   = g.get("groq_vision_vote", "Offline")
+    grc   = g.get("groq_vision_confidence", 0)
+    grm   = g.get("groq_vision_model", "Groq Vision")
+    with vcol2:
+        gr_color = _NEON.get(grv, "#555")
+        st.markdown(
+            "<div class='ai-card' style='border-color:" + gr_color + "44;text-align:center;'>"
+            "<div style='margin-bottom:6px;'>" + _platform_badge("Groq") + "</div>"
+            "<div style='font-size:.85rem;color:#8090a8;margin-bottom:4px;'>" + grm.split("/")[-1] + "</div>"
+            "<div style='font-size:2rem;font-weight:900;color:" + gr_color + ";'>"
+            + VOTE_ICON.get(grv, "❓") + " " + grv + "</div>"
+            "<div style='font-size:.78rem;color:#6a82a0;margin-top:4px;'>" + str(grc) + "% confidence</div>"
+            "<div style='font-size:.8rem;color:#a0b4c8;margin-top:8px;font-style:italic;'>"
+            + g.get("groq_vision_reasoning", "") + "</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Technical analysis detail ─────────────────────────────────────────────
+    with st.expander("📊 " + vision + " — Full Technical Analysis + Market News", expanded=False):
+        c1, c2, c3 = st.columns(3)
         c1.metric("Asset",     g.get("asset",     "—"))
         c2.metric("Timeframe", g.get("timeframe", "—"))
         c3.metric("Trend",     g.get("trend",     "—"))
-        v = g.get("gemini_vote", "WAIT")
-        c4.metric("Vision Vote",
-                  (VOTE_ICON.get(v, "") + " " + v).strip(),
-                  str(g.get("gemini_confidence", 0)) + "% confidence")
 
         st.info("**Technical Summary:** " + g.get("technical_summary", ""))
 
@@ -808,7 +898,6 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
             dot  = "🟢" if sent == "Bullish" else ("🔴" if sent == "Bearish" else "🟡")
             st.markdown(dot + " **" + item.get("headline", "") + "**  \n*" + item.get("source", "") + "*")
         st.markdown("**News Summary:** " + g.get("news_summary", ""))
-        st.markdown("💬 *" + g.get("gemini_reasoning", "") + "*")
 
 
 def _platform_badge(platform: str) -> str:
@@ -876,16 +965,24 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
     st.markdown("<div class='step-header'>🗳️ All AI Votes at a Glance</div>",
                 unsafe_allow_html=True)
 
-    vision_name = chart_data.get("vision_model", "Vision")
-    vision_platform = "Gemini" if "gemini" in vision_name.lower() else "Groq"
-
-    entries = [{
-        "model":    vision_name,
-        "vote":     chart_data.get("gemini_vote", "WAIT"),
-        "conf":     chart_data.get("gemini_confidence", 0),
-        "icon":     _model_icon(vision_name),
-        "platform": vision_platform,
-    }] + [{
+    # Both vision committee members always get their own scoreboard tile
+    groq_vis_model = chart_data.get("groq_vision_model", "Groq Vision")
+    entries = [
+        {
+            "model":    "Gemini 2.0 Flash",
+            "vote":     chart_data.get("gemini_vote", "WAIT"),
+            "conf":     chart_data.get("gemini_confidence", 0),
+            "icon":     "✨",
+            "platform": "Gemini",
+        },
+        {
+            "model":    groq_vis_model.split("/")[-1],
+            "vote":     chart_data.get("groq_vision_vote", "Offline"),
+            "conf":     chart_data.get("groq_vision_confidence", 0),
+            "icon":     "⚡",
+            "platform": "Groq",
+        },
+    ] + [{
         "model":    v.get("model", "?"),
         "vote":     v.get("vote",  "WAIT"),
         "conf":     v.get("confidence", 0),
