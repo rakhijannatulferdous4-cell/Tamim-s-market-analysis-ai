@@ -3,20 +3,18 @@ AI Trading Debate — crash-proof, future-proof.
 
 Pipeline
 ────────
-Step 1  Chart Vision  : Gemini 2.0 Flash  (google-generativeai stable SDK)
-                        → live Groq vision catalog  (seeded with known 2026 models)
-                        → text-fallback if all vision APIs fail
+Step 1  Chart Vision  : Live Groq vision model  (auto-discovered from Groq catalog)
+                        → text-fallback if vision API fails
 Step 2  Analyst Votes : Top-3 Groq text models  (live auto-discovery)
                           explicit preference: llama-3.3-70b-versatile, qwen-2.5-32b
                         + DeepSeek-Chat (skipped gracefully on 402)
                         + any custom models added by the user in the sidebar
                         <think>…</think> tokens stripped before JSON parsing
-Step 3  Final Verdict : Gemini 2.0 Flash synthesis → top Groq text model fallback
+Step 3  Final Verdict : Top Groq text model synthesis
                         → FINAL_DECISION + candle recommendation box
 """
 
 import base64
-import io
 import json
 import os
 import re
@@ -237,10 +235,7 @@ CHART_ANALYSIS_JSON_SPEC = """\
     {"headline": "<text>", "sentiment": "<Bullish|Bearish|Neutral>", "source": "<src>"}
   ],
   "news_summary": "<2-sentence overall news sentiment summary>",
-  "vision_model": "<which model performed this analysis>",
-  "gemini_vote": "<UP|DOWN|WAIT>",
-  "gemini_confidence": <0-100>,
-  "gemini_reasoning": "<one concise sentence>"
+  "vision_model": "<which model performed this analysis>"
 }"""
 
 CHART_PROMPT_TEXT = (
@@ -270,30 +265,8 @@ _TEXT_FALLBACK_DATA: dict = {
     "live_news": [],
     "news_summary": "No live news available. Assume high uncertainty.",
     "vision_model": "Text Fallback (no vision API available)",
-    "gemini_vote": "WAIT",
-    "gemini_confidence": 0,
-    "gemini_reasoning": "Vision analysis unavailable — apply strict risk management.",
 }
 
-
-def _gemini_vision(image_bytes: bytes, extra: str) -> dict:
-    """
-    Call Gemini 2.0 Flash via the stable google-generativeai SDK.
-    Passes a PIL Image directly — no blob/Blob, no v1beta path issues.
-    """
-    import google.generativeai as genai
-
-    genai.configure(api_key=require_secret("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.0-flash")
-
-    extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
-    prompt = CHART_PROMPT_TEXT + extra_line + "\n" + CHART_ANALYSIS_JSON_SPEC
-
-    img = Image.open(io.BytesIO(image_bytes))
-    response = model.generate_content([img, prompt])
-    result = parse_json(response.text)
-    result["vision_model"] = "Gemini 2.0 Flash"
-    return result
 
 
 def _groq_vision(image_bytes: bytes, mime: str, extra: str,
@@ -350,59 +323,6 @@ def _groq_vision(image_bytes: bytes, mime: str, extra: str,
     return result
 
 
-def _gemini_text_vote(chart_data: dict) -> dict:
-    """
-    When Gemini vision is rate-limited (429), call its text API instead.
-    It reads the chart analysis extracted by Groq's vision model and casts
-    an independent UP/DOWN/WAIT vote based on that structured text data.
-    Returns {"vote": ..., "confidence": ..., "reasoning": ...}.
-    """
-    import google.generativeai as genai
-
-    support    = ", ".join(chart_data.get("support", []))
-    resistance = ", ".join(chart_data.get("resistance", []))
-    indicators = "; ".join(
-        f"{k}: {v}" for k, v in chart_data.get("indicators", {}).items()
-    )
-    patterns   = ", ".join(chart_data.get("patterns", []))
-    news_lines = "\n".join(
-        "- " + item.get("headline", "") + " [" + item.get("sentiment", "") + "]"
-        for item in chart_data.get("live_news", [])
-    )
-
-    prompt = (
-        "You are a senior technical analyst. A Groq vision AI read a trading chart "
-        "and extracted the structured data below. Your vision API is quota-limited, "
-        "so you must analyze this TEXT data and provide your own independent vote.\n\n"
-        "=== CHART DATA (extracted by Groq Llama-4 Vision) ===\n"
-        "Asset       : " + chart_data.get("asset", "unknown") + "\n"
-        "Timeframe   : " + chart_data.get("timeframe", "unknown") + "\n"
-        "Trend       : " + chart_data.get("trend", "unknown") + "\n"
-        "Support     : " + support + "\n"
-        "Resistance  : " + resistance + "\n"
-        "Indicators  : " + indicators + "\n"
-        "Patterns    : " + patterns + "\n"
-        "Summary     : " + chart_data.get("technical_summary", "") + "\n"
-        "Market News :\n" + news_lines + "\n"
-        "News Summary: " + chart_data.get("news_summary", "") + "\n"
-        "Groq Vote   : " + chart_data.get("groq_vision_vote", "?")
-        + " (" + str(chart_data.get("groq_vision_confidence", 0)) + "%)\n"
-        "Groq Says   : " + chart_data.get("groq_vision_reasoning", "") + "\n"
-        "====================================================\n\n"
-        "Analyze the above data independently and provide your directional vote. "
-        "Do NOT just agree with Groq — form your own view.\n\n"
-        "Respond with valid JSON only:\n"
-        '{"vote": "UP"|"DOWN"|"WAIT", "confidence": 0-100, "reasoning": "one sentence"}'
-    )
-
-    genai.configure(api_key=require_secret("GEMINI_API_KEY"))
-    model    = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(prompt)
-    result   = parse_json(response.text)
-    result.setdefault("vote",       "WAIT")
-    result.setdefault("confidence", 50)
-    result.setdefault("reasoning",  "Based on Groq Llama-4 vision analysis.")
-    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -480,26 +400,9 @@ def _inject_real_news(chart_data: dict) -> dict:
 
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
-    Runs BOTH Gemini AND Groq vision — each always gets its own committee vote.
+    Runs Groq vision to read the chart.
     Returns (chart_data, status_message). Never raises.
-
-    chart_data fields added:
-        gemini_vote / gemini_confidence / gemini_reasoning   — Gemini's slot
-        groq_vision_model / groq_vision_vote /               — Groq's slot
-        groq_vision_confidence / groq_vision_reasoning
-
-    Primary technical analysis (support, resistance, etc.) comes from
-    Gemini when online; otherwise from the best available Groq vision model.
     """
-    # ── 1. Try Gemini ─────────────────────────────────────────────────────────
-    gemini_data  = None
-    gemini_error = ""
-    try:
-        gemini_data = _gemini_vision(image_bytes, extra)
-    except Exception as exc:
-        gemini_error = f"{type(exc).__name__}: {str(exc)[:220]}"
-
-    # ── 2. Try best available Groq vision model ───────────────────────────────
     groq_data       = None
     groq_error      = ""
     groq_model_used = ""
@@ -511,59 +414,13 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
         except Exception as exc:
             groq_error += f"{model_id}: {str(exc)[:60]}; "
 
-    # ── 3. Merge both results ─────────────────────────────────────────────────
-    if gemini_data and groq_data:
-        chart_data = gemini_data                            # Gemini = primary analysis
+    if groq_data:
+        chart_data = groq_data
         chart_data["groq_vision_model"]      = groq_model_used
         chart_data["groq_vision_vote"]       = groq_data.get("vote", "WAIT")
         chart_data["groq_vision_confidence"] = groq_data.get("confidence", 50)
         chart_data["groq_vision_reasoning"]  = groq_data.get("reasoning", "")
-        status = (
-            "✅ **Gemini 2.0 Flash** ✨ AND **"
-            + groq_model_used + "** ⚡ both analyzed the chart."
-        )
-
-    elif gemini_data:
-        chart_data = gemini_data
-        chart_data["groq_vision_model"]      = "Groq Vision"
-        chart_data["groq_vision_vote"]       = "Offline"
-        chart_data["groq_vision_confidence"] = 0
-        chart_data["groq_vision_reasoning"]  = "Groq vision unavailable — " + groq_error[:100]
-        status = (
-            "⚠️ Groq vision offline. "
-            "**Gemini 2.0 Flash** completed the chart analysis."
-        )
-
-    elif groq_data:
-        chart_data = groq_data                              # Groq = primary analysis
-        chart_data["groq_vision_model"]      = groq_model_used
-        chart_data["groq_vision_vote"]       = groq_data.get("vote", "WAIT")
-        chart_data["groq_vision_confidence"] = groq_data.get("confidence", 50)
-        chart_data["groq_vision_reasoning"]  = groq_data.get("reasoning", "")
-
-        # ── Gemini text fallback: read Groq's extracted analysis via text API ─
-        is_quota_err = "429" in gemini_error or "quota" in gemini_error.lower() or "resource" in gemini_error.lower()
-        try:
-            gem_text = _gemini_text_vote(chart_data)
-            chart_data["gemini_vote"]       = gem_text.get("vote", "WAIT")
-            chart_data["gemini_confidence"] = gem_text.get("confidence", 50)
-            chart_data["gemini_reasoning"]  = gem_text.get("reasoning", "")
-            chart_data["gemini_mode"]       = "text"
-            status = (
-                "⚠️ Gemini vision quota hit — switched to **text mode**. "
-                "Groq **" + groq_model_used + "** read the chart; "
-                "Gemini analyzed the extracted data via text API."
-            )
-        except Exception as tex:
-            chart_data["gemini_vote"]       = "Offline"
-            chart_data["gemini_confidence"] = 0
-            chart_data["gemini_reasoning"]  = "Gemini offline — " + gemini_error[:120]
-            chart_data["gemini_mode"]       = "offline"
-            status = (
-                "⚠️ Gemini offline (" + gemini_error[:120] + "). "
-                "**" + groq_model_used + "** (Groq vision) completed the analysis."
-            )
-
+        status = "✅ **" + groq_model_used.split("/")[-1] + "** ⚡ analyzed the chart."
     else:
         chart_data = dict(_TEXT_FALLBACK_DATA)
         if extra.strip():
@@ -571,11 +428,10 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
         chart_data["groq_vision_model"]      = "Groq Vision"
         chart_data["groq_vision_vote"]       = "Offline"
         chart_data["groq_vision_confidence"] = 0
-        chart_data["groq_vision_reasoning"]  = "All vision APIs failed."
-        all_errs = "Gemini: " + gemini_error + " | Groq: " + groq_error
+        chart_data["groq_vision_reasoning"]  = "Vision API unavailable."
         status = (
-            "🚨 **All vision APIs failed** — text-fallback mode.\n\n"
-            "Errors: " + all_errs[:300]
+            "🚨 **Groq vision unavailable** — text-fallback mode.\n\nErrors: "
+            + groq_error[:300]
         )
 
     return chart_data, status
@@ -655,11 +511,8 @@ def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
         "Indicators:\n" + indicators + "\n"
         "Chart Patterns: " + (", ".join(g.get("patterns", [])) or "None observed") + "\n"
         "Technical Summary:\n  " + g.get("technical_summary", "") + "\n\n"
-        "Vision AI Readings (chart screenshot analysed by multimodal models):\n"
-        "  Gemini 2.0 Flash → " + str(g.get("gemini_vote", "?"))
-        + " (" + str(g.get("gemini_confidence", 0)) + "%) — "
-        + g.get("gemini_reasoning", "") + "\n"
-        "  Groq " + g.get("groq_vision_model", "Vision") + " → "
+        "Vision AI Reading (Groq vision model read the chart):\n"
+        "  " + g.get("groq_vision_model", "Groq Vision").split("/")[-1] + " → "
         + str(g.get("groq_vision_vote", "?"))
         + " (" + str(g.get("groq_vision_confidence", 0)) + "%) — "
         + g.get("groq_vision_reasoning", "") + "\n\n"
@@ -933,11 +786,7 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
     user_ctx   = (chart_data.get("user_context") or "").strip()
 
     positions = (
-        "Gemini 2.0 Flash (Vision): "
-        + chart_data.get("gemini_vote", "WAIT")
-        + " (" + str(chart_data.get("gemini_confidence", 0)) + "%) — "
-        + chart_data.get("gemini_reasoning", "") + "\n"
-        + chart_data.get("groq_vision_model", "Groq Vision") + " (Vision): "
+        chart_data.get("groq_vision_model", "Groq Vision").split("/")[-1] + " (Vision): "
         + chart_data.get("groq_vision_vote", "WAIT")
         + " (" + str(chart_data.get("groq_vision_confidence", 0)) + "%) — "
         + chart_data.get("groq_vision_reasoning", "") + "\n"
@@ -952,7 +801,7 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         )
 
     online_names = (
-        ["Gemini 2.0 Flash", chart_data.get("groq_vision_model", "Groq Vision")]
+        [chart_data.get("groq_vision_model", "Groq Vision").split("/")[-1]]
         + [v.get("model", "?") for v in analyst_votes]
     )
 
@@ -1021,26 +870,18 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
 def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
     """
     Cross-examines all analyst opinions → FINAL_DECISION + candle recommendation.
-    Primary: Gemini 2.0 Flash (stable SDK).  Fallback: top Groq text model.
+    Uses the top available Groq text model.
     """
-    import google.generativeai as genai
+    from groq import Groq
 
-    prompt = _build_synthesis_prompt(chart_data, analyst_votes)
-
-    synth_model = "Gemini 2.0 Flash"
-    try:
-        genai.configure(api_key=require_secret("GEMINI_API_KEY"))
-        model    = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content(prompt)
-        result   = parse_json(response.text)
-    except Exception as gemini_err:
+    prompt  = _build_synthesis_prompt(chart_data, analyst_votes)
+    models  = _discover_groq_text_models(n=2)
+    last_err = ""
+    for model_id, label in models:
         try:
-            from groq import Groq
-            fallback_models = _discover_groq_text_models(n=1)
-            fallback_id     = fallback_models[0][0]
-            client_g = Groq(api_key=require_secret("GROQ_API_KEY"))
-            chat = client_g.chat.completions.create(
-                model=fallback_id,
+            client = Groq(api_key=require_secret("GROQ_API_KEY"))
+            chat = client.chat.completions.create(
+                model=model_id,
                 messages=[
                     {"role": "system",
                      "content": "You are a trading debate moderator. Respond with valid JSON only."},
@@ -1049,17 +890,13 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
                 temperature=0.3,
                 max_tokens=1000,
             )
-            result      = parse_json(chat.choices[0].message.content)
-            synth_model = _short_label(fallback_id) + " (Groq fallback)"
-        except Exception as groq_err:
-            raise RuntimeError(
-                "Both synthesis models failed.\n"
-                "Gemini: " + str(gemini_err) + "\n"
-                "Groq: "   + str(groq_err)
-            )
-
-    result["_synth_model"] = synth_model
-    return result
+            result = parse_json(chat.choices[0].message.content)
+            result["_synth_model"] = label + " (Groq)"
+            return result
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError("Synthesis failed — " + last_err)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1327,45 +1164,18 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
     else:
         st.success(status_msg)
 
-    # ── Vision votes side-by-side ─────────────────────────────────────────────
+    # ── Vision card ───────────────────────────────────────────────────────────
     st.markdown(
         "<div class='step-header' style='font-size:1rem;margin:12px 0 8px;'>"
-        "👁️ Vision Committee — Both AIs Read the Chart</div>",
+        "👁️ Vision Analysis</div>",
         unsafe_allow_html=True,
     )
-    vcol1, vcol2 = st.columns(2)
-
-    gv         = g.get("gemini_vote", "WAIT")
-    gc         = g.get("gemini_confidence", 0)
-    gemini_mode = g.get("gemini_mode", "vision")   # "vision" | "text" | "offline"
-    mode_label  = (
-        "<span style='font-size:.7rem;color:#f0a500;background:#2a1e00;"
-        "border-radius:4px;padding:1px 6px;margin-left:6px;'>📄 Text Mode</span>"
-        if gemini_mode == "text" else ""
-    )
-    with vcol1:
-        g_color = _NEON.get(gv, "#555")
-        st.markdown(
-            "<div class='ai-card' style='border-color:" + g_color + "44;text-align:center;'>"
-            "<div style='margin-bottom:6px;'>" + _platform_badge("Gemini") + mode_label + "</div>"
-            "<div style='font-size:.85rem;color:#8090a8;margin-bottom:4px;'>Gemini 2.0 Flash</div>"
-            "<div style='font-size:2rem;font-weight:900;color:" + g_color + ";'>"
-            + VOTE_ICON.get(gv, "❓") + " " + gv + "</div>"
-            "<div style='font-size:.78rem;color:#6a82a0;margin-top:4px;'>" + str(gc) + "% confidence</div>"
-            "<div style='font-size:.8rem;color:#a0b4c8;margin-top:8px;font-style:italic;'>"
-            + g.get("gemini_reasoning", "") + "</div>"
-            + ("<div style='font-size:.7rem;color:#f0a500;margin-top:6px;'>"
-               "👁️ Vision quota hit — voted from Groq's extracted text analysis</div>"
-               if gemini_mode == "text" else "")
-            + "</div>",
-            unsafe_allow_html=True,
-        )
-
-    grv   = g.get("groq_vision_vote", "Offline")
-    grc   = g.get("groq_vision_confidence", 0)
-    grm   = g.get("groq_vision_model", "Groq Vision")
-    with vcol2:
-        gr_color = _NEON.get(grv, "#555")
+    grv      = g.get("groq_vision_vote", "Offline")
+    grc      = g.get("groq_vision_confidence", 0)
+    grm      = g.get("groq_vision_model", "Groq Vision")
+    gr_color = _NEON.get(grv, "#555")
+    _, vcenter, _ = st.columns([1, 2, 1])
+    with vcenter:
         st.markdown(
             "<div class='ai-card' style='border-color:" + gr_color + "44;text-align:center;'>"
             "<div style='margin-bottom:6px;'>" + _platform_badge("Groq") + "</div>"
@@ -1531,16 +1341,9 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
     st.markdown("<div class='step-header'>🗳️ All AI Votes at a Glance</div>",
                 unsafe_allow_html=True)
 
-    # Both vision committee members always get their own scoreboard tile
+    # Vision model always gets its own scoreboard tile
     groq_vis_model = chart_data.get("groq_vision_model", "Groq Vision")
     entries = [
-        {
-            "model":    "Gemini 2.0 Flash",
-            "vote":     chart_data.get("gemini_vote", "WAIT"),
-            "conf":     chart_data.get("gemini_confidence", 0),
-            "icon":     "✨",
-            "platform": "Gemini",
-        },
         {
             "model":    groq_vis_model.split("/")[-1],
             "vote":     chart_data.get("groq_vision_vote", "Offline"),
