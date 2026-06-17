@@ -101,9 +101,16 @@ def parse_json(text: str) -> dict:
 # Groq model discovery helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _GROQ_TEXT_EXCLUDE = frozenset(
-    # Exclude non-text, non-chat, and reasoning models that emit plain-text
-    # chain-of-thought instead of JSON (qwq = QwQ, think = thinking variants)
-    ["vision", "whisper", "guard", "embed", "tts", "distil", "qwq", "think"]
+    # Exclude non-text, non-chat, and reasoning/TTS/embed models.
+    # Also exclude third-party models that require separate terms acceptance
+    # (canopylabs, orpheus) and compound which hits 413 payload limits.
+    [
+        "vision", "whisper", "guard", "embed", "tts", "distil",
+        "qwq", "think",                          # reasoning chain-of-thought
+        "canopylabs", "orpheus",                 # require extra terms acceptance
+        "compound",                              # context/payload too large (413)
+        "arabic", "saudi",                       # specialized non-JSON models
+    ]
 )
 
 # Hard fallback list used when the live API call fails
@@ -577,7 +584,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Independent analyst votes
 # ─────────────────────────────────────────────────────────────────────────────
-def build_analyst_prompt(model_name: str, g: dict) -> str:
+def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
     indicators = (
         "\n".join("    " + k + ": " + str(v)
                   for k, v in g.get("indicators", {}).items())
@@ -585,22 +592,56 @@ def build_analyst_prompt(model_name: str, g: dict) -> str:
     )
 
     # Prefer real web-searched news; fall back to AI-generated news list
+    # short=True is used for 413-retry — truncate news to save tokens
+    news_items = g.get("live_news", [])
+    if short:
+        news_items = news_items[:2]
     news_ctx = g.get("news_context", "")
+    if short and news_ctx:
+        news_ctx = "\n".join(news_ctx.split("\n")[:3])  # first 3 lines only
     if not news_ctx:
         news_ctx = (
             "\n".join(
                 "  • [" + n.get("sentiment", "?") + "] "
                 + n.get("headline", "") + " — " + n.get("source", "")
                 + (" (" + n.get("date", "") + ")" if n.get("date") else "")
-                for n in g.get("live_news", [])
+                for n in news_items
             )
             or "  No live news available at this time."
+        )
+
+    # Trader's own notes — these override/supplement everything else
+    user_ctx = (g.get("user_context") or "").strip()
+    user_section = (
+        "══════════════════════════════════════════════════════\n"
+        "  ⚠️  TRADER'S NOTES — READ AND FOLLOW THESE CAREFULLY\n"
+        "══════════════════════════════════════════════════════\n"
+        + user_ctx + "\n\n"
+    ) if user_ctx else ""
+
+    if short:
+        # Compact version for models with small context windows (413 retry)
+        return (
+            "You are " + model_name + ", an AI trading analyst.\n"
+            + (("TRADER NOTES: " + user_ctx + "\n\n") if user_ctx else "")
+            + "Asset: " + g.get("asset", "?") + " | TF: " + g.get("timeframe", "?")
+            + " | Trend: " + g.get("trend", "?") + "\n"
+            + "Support: " + (", ".join(g.get("support", [])) or "N/A") + "\n"
+            + "Resistance: " + (", ".join(g.get("resistance", [])) or "N/A") + "\n"
+            + "Summary: " + g.get("technical_summary", "")[:300] + "\n"
+            + "News: " + news_ctx[:200] + "\n\n"
+            + 'Return ONLY valid JSON: {"model":"' + model_name + '",'
+            '"vote":"UP"|"DOWN"|"WAIT","confidence":0-100,'
+            '"reasoning":"<one sentence>","analysis":"<brief>","key_risks":["r1"],'
+            '"news_sentiment":"BULLISH"|"BEARISH"|"NEUTRAL","technical_score":0}'
         )
 
     return (
         "You are " + model_name + ", a senior AI quant-analyst and trading strategist.\n\n"
         "Below is everything you need: live chart data, real-time news, and vision AI\n"
         "readings. Study ALL of it rigorously, then produce a high-conviction trade signal.\n\n"
+
+        + user_section +
 
         "══════════════════════════════════════════════════════\n"
         "  SECTION 1 — CHART TECHNICAL DATA\n"
@@ -630,21 +671,21 @@ def build_analyst_prompt(model_name: str, g: dict) -> str:
         "News Summary (vision AI): " + g.get("news_summary", "N/A") + "\n\n"
 
         "══════════════════════════════════════════════════════\n"
-        "  SECTION 3 — YOUR ANALYSIS CHECKLIST\n"
+        "  SECTION 3 — YOUR ANALYSIS CHECKLIST (answer all 8)\n"
         "══════════════════════════════════════════════════════\n"
-        "Work through each point and summarise your findings in the 'analysis' field:\n\n"
-        "1. TREND STRUCTURE — Is this an uptrend, downtrend, or range? Higher highs/lows?\n"
-        "2. RSI — Is it overbought (>70), oversold (<30), neutral? Any bullish/bearish divergence?\n"
-        "3. MACD — Bullish or bearish crossover? Is the histogram expanding or contracting?\n"
-        "4. SUPPORT / RESISTANCE — Is price near a key level? Is it breaking out or rejecting?\n"
-        "5. VOLUME — Does volume confirm the move? Climax candle, volume dry-up, or spike?\n"
-        "6. PATTERNS — Any reversal (H&S, double top/bottom) or continuation (flag, pennant)?\n"
-        "7. NEWS SENTIMENT — Are the headlines bullish, bearish, or neutral for this asset?\n"
-        "8. SYNTHESIS — Weighing ALL 7 points above: what is the highest-probability move?\n\n"
+        "Work through each point; summarise findings in the 'analysis' field:\n\n"
+        "1. TREND STRUCTURE — uptrend, downtrend, or range? Higher highs/lows?\n"
+        "2. RSI — overbought (>70), oversold (<30), neutral? Divergence?\n"
+        "3. MACD — bullish or bearish crossover? Histogram expanding or contracting?\n"
+        "4. SUPPORT / RESISTANCE — price near key level? Breaking out or rejecting?\n"
+        "5. VOLUME — confirming the trend? Volume spike, dry-up, or climax?\n"
+        "6. PATTERNS — reversal (H&S, double top/bottom) or continuation (flag, pennant)?\n"
+        "7. NEWS SENTIMENT — are headlines bullish, bearish, or neutral?\n"
+        "8. SYNTHESIS — weighing ALL above: what is the highest-probability next move?\n\n"
         "Return ONLY valid JSON — absolutely no markdown, no extra text:\n"
         '{\n'
         '  "model": "' + model_name + '",\n'
-        '  "analysis": "<rigorous ~4 sentence analysis covering ALL 8 checklist points>",\n'
+        '  "analysis": "<4-sentence analysis covering ALL 8 checklist points above>",\n'
         '  "key_risks": ["<precise risk 1>", "<precise risk 2>", "<precise risk 3>"],\n'
         '  "vote": "UP"|"DOWN"|"WAIT",\n'
         '  "confidence": 0-100,\n'
@@ -674,15 +715,42 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
             response_format={"type": "json_object"},
         )
         raw = chat.choices[0].message.content
-    except Exception:
-        # Model doesn't support response_format — fall back to plain call
-        chat = client.chat.completions.create(
-            model=model_id,
-            messages=[sys_msg, user_msg],
-            temperature=0.4,
-            max_tokens=1200,
-        )
-        raw = chat.choices[0].message.content
+    except Exception as e:
+        err = str(e)
+        # 400 terms-acceptance — fail clearly so user sees which model needs terms
+        if "400" in err and "terms" in err.lower():
+            raise RuntimeError(
+                "Error 400 — model requires terms acceptance at console.groq.com. "
+                "Open Groq playground for this model and accept the terms, then retry."
+            ) from e
+        # 413 request too large — retry with shorter (news-trimmed) prompt
+        if "413" in err or "request_too_large" in err:
+            short_prompt = build_analyst_prompt(model_name, chart_data, short=True)
+            try:
+                chat = client.chat.completions.create(
+                    model=model_id,
+                    messages=[sys_msg, {"role": "user", "content": short_prompt}],
+                    temperature=0.4,
+                    max_tokens=600,
+                )
+                raw = chat.choices[0].message.content
+            except Exception as e2:
+                raise RuntimeError(
+                    "Error 413 — prompt too large for this model's context window. "
+                    "Remove it or use a model with a larger context."
+                ) from e2
+        else:
+            # Other errors: retry without response_format (some models don't support it)
+            try:
+                chat = client.chat.completions.create(
+                    model=model_id,
+                    messages=[sys_msg, user_msg],
+                    temperature=0.4,
+                    max_tokens=1200,
+                )
+                raw = chat.choices[0].message.content
+            except Exception:
+                raise
 
     result = parse_json(raw)
     result.setdefault("model", model_name)
@@ -860,7 +928,9 @@ def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
     tf         = chart_data.get("timeframe", "unknown")
-    tf_minutes = chart_data.get("timeframe_minutes", 0)
+    tf_minutes = int(chart_data.get("timeframe_minutes", 0) or 0)
+    asset      = chart_data.get("asset", "the asset")
+    user_ctx   = (chart_data.get("user_context") or "").strip()
 
     positions = (
         "Gemini 2.0 Flash (Vision): "
@@ -877,8 +947,8 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
             v.get("model", "?") + ": " + v.get("vote", "WAIT")
             + " (" + str(v.get("confidence", 0)) + "%) — "
             + v.get("reasoning", "") + "\n"
-            + "  Analysis  : " + v.get("analysis", "") + "\n"
-            + "  Key Risks : " + ", ".join(v.get("key_risks", [])) + "\n"
+            "  Analysis  : " + v.get("analysis", "") + "\n"
+            "  Key Risks : " + ", ".join(v.get("key_risks", [])) + "\n"
         )
 
     online_names = (
@@ -886,24 +956,48 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         + [v.get("model", "?") for v in analyst_votes]
     )
 
+    # Build a concrete hold-duration guide based on the real timeframe
+    if tf_minutes > 0:
+        min_hold = tf_minutes * 2
+        max_hold = tf_minutes * 8
+        candle_guide = (
+            "Each candle = " + str(tf_minutes) + " min on this chart.\n"
+            "   Pick candle_count between 2 and 8 based on signal strength:\n"
+            "     STRONG consensus → 5-8 candles (~" + str(tf_minutes * 5) + "-" + str(tf_minutes * 8) + " min hold)\n"
+            "     MODERATE consensus → 3-5 candles (~" + str(tf_minutes * 3) + "-" + str(tf_minutes * 5) + " min hold)\n"
+            "     WEAK / uncertain → 2-3 candles (~" + str(tf_minutes * 2) + "-" + str(tf_minutes * 3) + " min hold)\n"
+            "   total_duration_minutes MUST equal candle_count × " + str(tf_minutes) + " exactly.\n"
+            '   display_text format: "' + ("BUY" if True else "") + ' ' + asset + ' on ' + tf
+            + ' chart | Hold ~[N] candles ([total_duration_minutes] min) | Direction: [UP/DOWN]"\n'
+        )
+    else:
+        candle_guide = (
+            "Timeframe in minutes not detected — estimate hold based on typical "
+            + tf + " chart trading: 2-6 candles, realistic duration.\n"
+            '   display_text: "Trade ' + asset + ' — [direction] | Hold [N] candles on ' + tf + ' chart"\n'
+        )
+
+    user_section = (
+        "=== TRADER'S NOTES (follow these — they override defaults) ===\n"
+        + user_ctx + "\n"
+        "=============================================================\n\n"
+    ) if user_ctx else ""
+
     return (
         "You are the debate moderator for an AI trading analyst panel.\n\n"
-        "Models online (" + str(len(online_names)) + "): "
-        + ", ".join(online_names) + "\n\n"
-        "=== ALL ANALYST POSITIONS ===\n"
+        + user_section
+        + "Chart: " + asset + " | Timeframe: " + tf + " | Models online ("
+        + str(len(online_names)) + "): " + ", ".join(online_names) + "\n\n"
+        "=== ALL POST-DELIBERATION ANALYST POSITIONS ===\n"
         + positions
-        + "==============================\n\n"
-        "Tasks:\n"
-        "1. Cross-examine — identify key agreements and disagreements.\n"
-        "2. Decide FINAL_DECISION (UP / DOWN / WAIT) based on evidence weight.\n"
-        "3. Compute RECOMMENDED_ACTION using the chart timeframe:\n"
-        "   Timeframe: " + tf + " (" + str(tf_minutes) + " minutes per candle)\n"
-        "   UP or DOWN: estimate candle_count (1-5), "
-        "total_duration_minutes = candle_count x timeframe_minutes.\n"
-        '     display_text: "TRADE DIRECTION: X | TARGET: Next N candles will go X '
-        '(Duration: Y minutes on a Z-min chart)"\n'
-        "   WAIT: should_trade = false, explain specific reason.\n"
-        '     display_text: "DON\'T TRADE: <reason with asset and timeframe>"\n\n'
+        + "================================================\n\n"
+        "Your tasks:\n"
+        "1. CROSS-EXAMINE — summarise key agreements and disagreements in 3-4 sentences.\n"
+        "2. FINAL_DECISION — choose UP, DOWN, or WAIT based on weight of evidence.\n"
+        "3. RECOMMENDED_ACTION — give a concrete, timeframe-specific trade instruction:\n"
+        "   Timeframe: " + tf + "\n"
+        "   " + candle_guide
+        + "   If WAIT: should_trade=false, explain the specific condition preventing a trade.\n\n"
         "Return ONLY valid JSON — no markdown:\n"
         "{\n"
         '  "cross_examination": "<3-4 sentence moderator analysis>",\n'
@@ -911,14 +1005,14 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         '  "consensus_strength": "<STRONG|MODERATE|DIVIDED>",\n'
         '  "FINAL_DECISION": "<UP|DOWN|WAIT>",\n'
         '  "confidence": <0-100>,\n'
-        '  "moderator_note": "<2-3 sentence summary for the trader>",\n'
+        '  "moderator_note": "<2-3 sentence actionable summary for the trader>",\n'
         '  "recommended_action": {\n'
         '    "should_trade": <true|false>,\n'
         '    "trade_direction": "<UP|DOWN|null>",\n'
-        '    "candle_count": <integer or null>,\n'
-        '    "total_duration_minutes": <integer or null>,\n'
+        '    "candle_count": <integer 2-8 or null>,\n'
+        '    "total_duration_minutes": <candle_count × ' + str(max(tf_minutes, 1)) + ' or null>,\n'
         '    "dont_trade_reason": "<string or null>",\n'
-        '    "display_text": "<formatted string per rules above>"\n'
+        '    "display_text": "<concrete trade instruction string>"\n'
         "  }\n"
         "}"
     )
@@ -1856,6 +1950,9 @@ with st.spinner("🔍 Reading chart…  Gemini primary → Groq vision fallback�
     chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
 
 asset_name = chart_data.get("asset", "asset")
+# Store trader's extra context in chart_data so ALL prompts can see it
+chart_data["user_context"] = extra_ctx.strip() if extra_ctx else ""
+
 with st.spinner("🌐 Searching latest market news for " + asset_name + "…"):
     chart_data = _inject_real_news(chart_data)
 
