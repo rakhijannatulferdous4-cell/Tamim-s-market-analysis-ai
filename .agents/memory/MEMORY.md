@@ -1,0 +1,1 @@
+- [Gemini Python SDK](gemini-python-sdk.md) — Use the maintained `google-genai` SDK for Gemini calls; avoid the deprecated `google.generativeai` package.

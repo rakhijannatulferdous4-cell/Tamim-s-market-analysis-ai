@@ -3,9 +3,11 @@ AI Trading Debate — crash-proof, future-proof.
 
 Pipeline
 ────────
-Step 1  Chart Vision  : Live Groq vision model  (auto-discovered from Groq catalog)
-                        → text-fallback if vision API fails
-Step 2  Analyst Votes : Top-3 Groq text models  (live auto-discovery)
+Step 1  Chart Vision  : Gemini 2.5 Flash (primary)
+                         → live Groq vision model fallback
+                         → text-fallback if vision APIs fail
+Step 2  Analyst Votes : Gemini 2.5 Flash + top Groq text models
+                         (live auto-discovery)
                           explicit preference: llama-3.3-70b-versatile, qwen-2.5-32b
                         + DeepSeek-Chat (skipped gracefully on 402)
                         + any custom models added by the user in the sidebar
@@ -268,6 +270,47 @@ _TEXT_FALLBACK_DATA: dict = {
 }
 
 
+def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
+    """Use the configured Gemini API key to analyse the uploaded chart."""
+    from google import genai
+    from google.genai import types
+
+    api_key = get_secret("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    client = genai.Client(api_key=api_key)
+    extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
+    prompt = (
+        CHART_PROMPT_TEXT
+        + extra_line
+        + "\n"
+        + CHART_ANALYSIS_JSON_SPEC
+        + "\n\nNote: Fill live_news with your best knowledge of recent market events."
+    )
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=image_bytes, mime_type=mime),
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+        ),
+    )
+    result = parse_json(response.text or "")
+    result["vision_model"] = "Gemini 2.5 Flash"
+    result["vision_provider"] = "Gemini"
+    result["gemini_vision_model"] = "Gemini 2.5 Flash"
+    result["gemini_vision_vote"] = result.get("vote") or "WAIT"
+    result["gemini_vision_confidence"] = result.get("confidence") or 50
+    result["gemini_vision_reasoning"] = (
+        result.get("reasoning") or "Gemini chart analysis."
+    )
+    return result
+
 
 def _groq_vision(image_bytes: bytes, mime: str, extra: str,
                  model_id: str, model_label: str) -> dict:
@@ -313,6 +356,7 @@ def _groq_vision(image_bytes: bytes, mime: str, extra: str,
     )
     result = parse_json(response.choices[0].message.content)
     result["vision_model"] = model_label
+    result["vision_provider"] = "Groq"
     # Normalise — model may return "vote" or "gemini_vote"; expose both consistently
     vote = result.get("vote") or result.get("gemini_vote") or "WAIT"
     conf = result.get("confidence") or result.get("gemini_confidence") or 50
@@ -400,9 +444,20 @@ def _inject_real_news(chart_data: dict) -> dict:
 
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
-    Runs Groq vision to read the chart.
+    Runs Gemini first, then Groq vision as a fallback.
     Returns (chart_data, status_message). Never raises.
     """
+    gemini_error = ""
+    try:
+        chart_data = _gemini_vision(image_bytes, mime, extra)
+        chart_data["groq_vision_model"] = "Not used"
+        chart_data["groq_vision_vote"] = "—"
+        chart_data["groq_vision_confidence"] = 0
+        chart_data["groq_vision_reasoning"] = "Gemini completed the primary vision pass."
+        return chart_data, "✅ **Gemini 2.5 Flash** analyzed the chart."
+    except Exception as exc:
+        gemini_error = str(exc)[:160]
+
     groq_data       = None
     groq_error      = ""
     groq_model_used = ""
@@ -429,9 +484,10 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
         chart_data["groq_vision_vote"]       = "Offline"
         chart_data["groq_vision_confidence"] = 0
         chart_data["groq_vision_reasoning"]  = "Vision API unavailable."
+        chart_data["vision_provider"]        = "Text fallback"
         status = (
-            "🚨 **Groq vision unavailable** — text-fallback mode.\n\nErrors: "
-            + groq_error[:300]
+            "🚨 **Gemini and Groq vision unavailable** — text-fallback mode.\n\n"
+            "Gemini: " + gemini_error + "\nGroq: " + groq_error[:220]
         )
 
     return chart_data, status
@@ -511,11 +567,14 @@ def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
         "Indicators:\n" + indicators + "\n"
         "Chart Patterns: " + (", ".join(g.get("patterns", [])) or "None observed") + "\n"
         "Technical Summary:\n  " + g.get("technical_summary", "") + "\n\n"
-        "Vision AI Reading (Groq vision model read the chart):\n"
-        "  " + g.get("groq_vision_model", "Groq Vision").split("/")[-1] + " → "
-        + str(g.get("groq_vision_vote", "?"))
-        + " (" + str(g.get("groq_vision_confidence", 0)) + "%) — "
-        + g.get("groq_vision_reasoning", "") + "\n\n"
+        "Vision AI Reading (" + g.get("vision_provider", "Vision AI")
+        + " read the chart):\n"
+        "  " + g.get("vision_model", "Vision Model").split("/")[-1] + " → "
+        + str(g.get("gemini_vision_vote", g.get("groq_vision_vote", "?")))
+        + " (" + str(g.get("gemini_vision_confidence",
+                            g.get("groq_vision_confidence", 0))) + "%) — "
+        + g.get("gemini_vision_reasoning",
+                g.get("groq_vision_reasoning", "")) + "\n\n"
 
         "══════════════════════════════════════════════════════\n"
         "  SECTION 2 — REAL-TIME MARKET NEWS (live web search)\n"
@@ -612,6 +671,33 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
     return result
 
 
+def _call_gemini(chart_data: dict) -> dict:
+    """Run Gemini as an independent analyst in the committee."""
+    from google import genai
+    from google.genai import types
+
+    api_key = get_secret("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    prompt = build_analyst_prompt("Gemini 2.5 Flash", chart_data)
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+        ),
+    )
+    result = parse_json(response.text or "")
+    result.setdefault("model", "Gemini 2.5 Flash")
+    result["_platform"] = "Gemini"
+    result["_model_id"] = "gemini-2.5-flash"
+    return result
+
+
 def _call_deepseek(chart_data: dict) -> dict:
     api_key = require_secret("DEEPSEEK_API_KEY")
     prompt  = build_analyst_prompt("DeepSeek-Chat", chart_data)
@@ -673,6 +759,32 @@ def _call_groq_raw(model_id: str, model_name: str, prompt: str) -> dict:
     result = parse_json(raw)
     result.setdefault("model", model_name)
     result["_platform"] = "Groq"
+    return result
+
+
+def _call_gemini_raw(model_name: str, prompt: str) -> dict:
+    """Call Gemini with a custom prompt for the deliberation round."""
+    from google import genai
+    from google.genai import types
+
+    api_key = get_secret("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+        ),
+    )
+    result = parse_json(response.text or "")
+    result.setdefault("model", model_name)
+    result["_platform"] = "Gemini"
+    result["_model_id"] = "gemini-2.5-flash"
     return result
 
 
@@ -759,6 +871,8 @@ def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
         try:
             if platform == "Groq" and model_id:
                 r = _call_groq_raw(model_id, model_name, prompt)
+            elif platform == "Gemini":
+                r = _call_gemini_raw(model_name, prompt)
             elif platform == "DeepSeek":
                 r = _call_deepseek_raw(model_name, prompt)
             else:
@@ -786,10 +900,13 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
     user_ctx   = (chart_data.get("user_context") or "").strip()
 
     positions = (
-        chart_data.get("groq_vision_model", "Groq Vision").split("/")[-1] + " (Vision): "
-        + chart_data.get("groq_vision_vote", "WAIT")
-        + " (" + str(chart_data.get("groq_vision_confidence", 0)) + "%) — "
-        + chart_data.get("groq_vision_reasoning", "") + "\n"
+        chart_data.get("vision_model", "Vision Model").split("/")[-1] + " (Vision): "
+        + chart_data.get("gemini_vision_vote",
+                          chart_data.get("groq_vision_vote", "WAIT"))
+        + " (" + str(chart_data.get("gemini_vision_confidence",
+                                    chart_data.get("groq_vision_confidence", 0))) + "%) — "
+        + chart_data.get("gemini_vision_reasoning",
+                         chart_data.get("groq_vision_reasoning", "")) + "\n"
     )
     for v in analyst_votes:
         positions += (
@@ -801,7 +918,7 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         )
 
     online_names = (
-        [chart_data.get("groq_vision_model", "Groq Vision").split("/")[-1]]
+        [chart_data.get("vision_model", "Vision Model").split("/")[-1]]
         + [v.get("model", "?") for v in analyst_votes]
     )
 
@@ -1170,21 +1287,23 @@ def render_chart_analysis(g: dict, status_msg: str) -> None:
         "👁️ Vision Analysis</div>",
         unsafe_allow_html=True,
     )
-    grv      = g.get("groq_vision_vote", "Offline")
-    grc      = g.get("groq_vision_confidence", 0)
-    grm      = g.get("groq_vision_model", "Groq Vision")
+    grv      = g.get("gemini_vision_vote", g.get("groq_vision_vote", "Offline"))
+    grc      = g.get("gemini_vision_confidence", g.get("groq_vision_confidence", 0))
+    grm      = g.get("vision_model", g.get("groq_vision_model", "Vision Model"))
+    provider = g.get("vision_provider", "Vision AI")
     gr_color = _NEON.get(grv, "#555")
     _, vcenter, _ = st.columns([1, 2, 1])
     with vcenter:
         st.markdown(
             "<div class='ai-card' style='border-color:" + gr_color + "44;text-align:center;'>"
-            "<div style='margin-bottom:6px;'>" + _platform_badge("Groq") + "</div>"
+            "<div style='margin-bottom:6px;'>" + _platform_badge(provider) + "</div>"
             "<div style='font-size:.85rem;color:#8090a8;margin-bottom:4px;'>" + grm.split("/")[-1] + "</div>"
             "<div style='font-size:2rem;font-weight:900;color:" + gr_color + ";'>"
             + VOTE_ICON.get(grv, "❓") + " " + grv + "</div>"
             "<div style='font-size:.78rem;color:#6a82a0;margin-top:4px;'>" + str(grc) + "% confidence</div>"
             "<div style='font-size:.8rem;color:#a0b4c8;margin-top:8px;font-style:italic;'>"
-            + g.get("groq_vision_reasoning", "") + "</div>"
+            + g.get("gemini_vision_reasoning",
+                    g.get("groq_vision_reasoning", "")) + "</div>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1342,14 +1461,21 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
                 unsafe_allow_html=True)
 
     # Vision model always gets its own scoreboard tile
-    groq_vis_model = chart_data.get("groq_vision_model", "Groq Vision")
+    vision_model = chart_data.get("vision_model", "Vision Model")
+    vision_provider = chart_data.get("vision_provider", "Vision AI")
     entries = [
         {
-            "model":    groq_vis_model.split("/")[-1],
-            "vote":     chart_data.get("groq_vision_vote", "Offline"),
-            "conf":     chart_data.get("groq_vision_confidence", 0),
-            "icon":     "⚡",
-            "platform": "Groq",
+            "model":    vision_model.split("/")[-1],
+            "vote":     chart_data.get(
+                "gemini_vision_vote",
+                chart_data.get("groq_vision_vote", "Offline"),
+            ),
+            "conf":     chart_data.get(
+                "gemini_vision_confidence",
+                chart_data.get("groq_vision_confidence", 0),
+            ),
+            "icon":     "✨" if vision_provider == "Gemini" else "⚡",
+            "platform": vision_provider,
         },
     ] + [{
         "model":    v.get("model", "?"),
@@ -1675,7 +1801,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "<p style='font-size:.7rem;color:#1e2e40;'>"
-        "Gemini 2.0 Flash &amp; DeepSeek-Chat always participate automatically.<br>"
+        "Gemini 2.5 Flash &amp; DeepSeek-Chat always participate automatically.<br>"
         "All added models use the same JSON vote rules.</p>",
         unsafe_allow_html=True,
     )
@@ -1791,7 +1917,8 @@ st.markdown(
 
 # Build the analyst roster: auto-discovered + DeepSeek + user-added custom models
 ANALYST_MODELS: list[tuple[str, str, str]] = (
-    [("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models]
+    [("gemini", "gemini-2.5-flash", "Gemini 2.5 Flash")]
+    + [("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models]
     + [("deepseek", "", "DeepSeek-Chat")]
     + [("groq", mid, mid) for mid in st.session_state["custom_models"]]
 )
@@ -1802,7 +1929,9 @@ offline_models: list[str]  = []
 for backend, model_id, model_name in ANALYST_MODELS:
     with st.spinner(_model_icon(model_name) + " " + model_name + " is analysing…"):
         try:
-            if backend == "groq":
+            if backend == "gemini":
+                result = _call_gemini(chart_data)
+            elif backend == "groq":
                 result = _call_groq(model_id, model_name, chart_data)
             else:
                 result = _call_deepseek(chart_data)
