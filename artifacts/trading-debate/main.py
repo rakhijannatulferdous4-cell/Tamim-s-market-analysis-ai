@@ -3,20 +3,18 @@ AI Trading Debate — crash-proof, future-proof.
 
 Pipeline
 ────────
-Step 1  Chart Vision  : Gemini 2.5 Flash (primary)
-                         → live Groq vision model fallback
-                         → text-fallback if vision APIs fail
-Step 2  Analyst Votes : Gemini 2.5 Flash + top Groq text models
-                         (live auto-discovery)
-                          explicit preference: llama-3.3-70b-versatile, qwen-2.5-32b
-                        + DeepSeek-Chat (skipped gracefully on 402)
-                        + any custom models added by the user in the sidebar
+ Step 1  Chart Vision  : live configured vision models
+                          → live Groq vision model fallback
+                          → text-fallback if vision APIs fail
+ Step 2  Analyst Votes : every activated vision-capable model
+                         (OpenRouter, Groq, Together AI, Gemini, or Hugging Face)
                         <think>…</think> tokens stripped before JSON parsing
 Step 3  Final Verdict : Top Groq text model synthesis
                         → FINAL_DECISION + candle recommendation box
 """
 
 import base64
+from html import escape
 import json
 import os
 import re
@@ -40,6 +38,11 @@ st.set_page_config(
 # Secret helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def get_secret(key: str) -> str:
+    # User-entered provider keys stay in the server-side Streamlit session.
+    # They are never written into browser-side HTML or sent to the client.
+    provider_keys = st.session_state.get("provider_keys", {})
+    if key in provider_keys and provider_keys[key]:
+        return str(provider_keys[key])
     val = ""
     try:
         val = st.secrets.get(key, "") or ""
@@ -97,6 +100,40 @@ def parse_json(text: str) -> dict:
             "_text_extraction": True}
 
 
+def _normalise_vote_fields(result: dict, default_reason: str) -> dict:
+    """Keep model-specific vote formats consistent in the UI and prompts."""
+    raw_vote = str(
+        result.get("vote")
+        or result.get("gemini_vote")
+        or result.get("direction")
+        or "WAIT"
+    ).upper()
+    result["vote"] = {
+        "BULLISH": "UP",
+        "BUY": "UP",
+        "BEARISH": "DOWN",
+        "SELL": "DOWN",
+        "NEUTRAL": "WAIT",
+        "HOLD": "WAIT",
+    }.get(raw_vote, raw_vote if raw_vote in {"UP", "DOWN", "WAIT"} else "WAIT")
+
+    raw_conf = result.get("confidence") or result.get("gemini_confidence") or 50
+    try:
+        confidence = float(raw_conf)
+        if 0 < confidence <= 1:
+            confidence *= 100
+        result["confidence"] = max(0, min(100, int(round(confidence))))
+    except (TypeError, ValueError):
+        result["confidence"] = 50
+
+    result["reasoning"] = (
+        result.get("reasoning")
+        or result.get("gemini_reasoning")
+        or default_reason
+    )
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Groq model discovery helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,55 +151,47 @@ _GROQ_TEXT_EXCLUDE = frozenset(
 )
 
 # Hard fallback list used when the live API call fails
-_GROQ_TEXT_FALLBACK = [
-    ("llama-3.3-70b-versatile", "Llama 3.3 70B"),
-    ("qwen-2.5-32b",            "Qwen 2.5 32B"),
-    ("llama-3.1-8b-instant",    "Llama 3.1 8B"),
-]
-
-# Seeded candidates for vision — newest first.
-# Dynamic discovery appends anything else in the live catalog.
-_GROQ_VISION_SEEDS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "llama-3.2-90b-vision-preview",
-    "llama-3.2-11b-vision-preview",
-]
+GEMINI_MODEL_ID = "gemini-3-flash-preview"
+GEMINI_MODEL_LABEL = "Gemini 3 Flash Preview"
 
 
 def _discover_groq_vision_models() -> list[str]:
     """
     Return an ordered list of vision-capable Groq model IDs.
-    Seeds come first; the live catalog appends any additional ones.
-    Never raises — returns seed list on any error.
+    Uses Groq's live input-modality metadata. Never returns retired model IDs.
     """
     try:
+        if not get_secret("GROQ_API_KEY"):
+            return []
         from groq import Groq
         client = Groq(api_key=require_secret("GROQ_API_KEY"))
         listing = client.models.list()
-        live_ids = {m.id for m in listing.data}
-        # Start with seeds that exist in the live catalog
-        queue = [s for s in _GROQ_VISION_SEEDS if s in live_ids]
-        # Append any additional vision models from catalog not already queued
-        for m in listing.data:
-            if "vision" in m.id.lower() and m.id not in queue:
-                queue.append(m.id)
-        return queue if queue else _GROQ_VISION_SEEDS
+        vision_models = [
+            m for m in listing.data
+            if "image" in (getattr(m, "input_modalities", []) or [])
+        ]
+        vision_models.sort(
+            key=lambda m: (
+                "qwen" not in m.id.lower(),
+                "3.6" not in m.id.lower(),
+                m.id,
+            )
+        )
+        return [m.id for m in vision_models]
     except Exception:
-        return _GROQ_VISION_SEEDS
+        return []
 
 
 def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
     """
     Return up to `n` text-only model IDs from Groq's live catalog,
     ranked by a quality heuristic. Explicit preferences always rank #1 and #2.
-    Falls back to _GROQ_TEXT_FALLBACK if discovery fails or yields nothing.
+    Returns an empty list when the live catalog cannot be read. This prevents
+    retired model IDs from being presented as active models.
     """
-    _PREFERRED = {
-        "llama-3.3-70b-versatile": 200,
-        "qwen-2.5-32b":            190,
-    }
     try:
+        if not get_secret("GROQ_API_KEY"):
+            return []
         from groq import Groq
         client = Groq(api_key=require_secret("GROQ_API_KEY"))
         listing = client.models.list()
@@ -172,15 +201,13 @@ def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
             mid_lower = m.id.lower()
             if any(x in mid_lower for x in _GROQ_TEXT_EXCLUDE):
                 continue
-            if m.id in _PREFERRED:
-                candidates.append((_PREFERRED[m.id], m.id))
-                continue
             score = 0
-            if "llama-3.3" in mid_lower:   score += 100
-            elif "qwen"    in mid_lower:   score += 90
+            if "qwen"    in mid_lower:     score += 115
+            elif "llama-3.3" in mid_lower: score += 110
             elif "llama-3.2" in mid_lower: score += 80
             elif "llama-3.1" in mid_lower: score += 70
             elif "llama-3"  in mid_lower:  score += 60
+            elif "gpt-oss" in mid_lower:   score += 55
             elif "mixtral"  in mid_lower:  score += 55
             elif "gemma"    in mid_lower:  score += 50
             else:                           score += 10
@@ -192,9 +219,9 @@ def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         result = [(mid, mid) for _, mid in candidates[:n]]
-        return result if result else _GROQ_TEXT_FALLBACK[:n]
+        return result
     except Exception:
-        return _GROQ_TEXT_FALLBACK[:n]
+        return []
 
 
 def _short_label(model_id: str) -> str:
@@ -202,7 +229,7 @@ def _short_label(model_id: str) -> str:
     mid = model_id.lower()
     # Handle meta-llama/ prefix
     base = mid.split("/")[-1]
-    for size in ["72b", "70b", "34b", "32b", "13b", "9b", "8b", "7b"]:
+    for size in ["120b", "72b", "70b", "34b", "32b", "27b", "20b", "13b", "9b", "8b", "7b"]:
         if size in base:
             if "llama-4-scout"    in base: return f"Llama 4 Scout {size.upper()}"
             if "llama-4-maverick" in base: return f"Llama 4 Maverick {size.upper()}"
@@ -214,6 +241,393 @@ def _short_label(model_id: str) -> str:
             if "gemma"      in base: return f"Gemma {size.upper()}"
             if "qwen"       in base: return f"Qwen {size.upper()}"
     return model_id.split("/")[-1].replace("-", " ").title()
+
+
+def _provider_configured(provider: str) -> bool:
+    """Return whether the provider has a credential available at runtime."""
+    key_by_provider = {
+        "Groq": "GROQ_API_KEY",
+        "OpenRouter": "OPENROUTER_API_KEY",
+        "Together AI": "TOGETHER_API_KEY",
+        "Google Gemini": "GEMINI_API_KEY",
+        "Hugging Face": "HF_TOKEN",
+    }
+    key_name = key_by_provider.get(provider, "")
+    return bool(get_secret(key_name) or (
+        provider == "Hugging Face" and get_secret("HUGGINGFACE_API_KEY")
+    ))
+
+
+_PROVIDER_CONFIG = {
+    "OpenRouter": {
+        "key": "OPENROUTER_API_KEY",
+        "models_url": "https://openrouter.ai/api/v1/models",
+        "chat_url": "https://openrouter.ai/api/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Groq": {
+        "key": "GROQ_API_KEY",
+        "models_url": "https://api.groq.com/openai/v1/models",
+        "chat_url": "https://api.groq.com/openai/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Together AI": {
+        "key": "TOGETHER_API_KEY",
+        "models_url": "https://api.together.xyz/v1/models",
+        "chat_url": "https://api.together.xyz/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Google Gemini": {
+        "key": "GEMINI_API_KEY",
+        "models_url": "https://generativelanguage.googleapis.com/v1beta/models",
+        "kind": "gemini",
+    },
+    "Hugging Face": {
+        "key": "HF_TOKEN",
+        "models_url": "https://huggingface.co/api/models",
+        "chat_url": "https://router.huggingface.co/v1/chat/completions",
+        "kind": "openai",
+    },
+}
+
+
+def _provider_key(provider: str) -> str:
+    """Read a configured provider key without ever rendering its value."""
+    config = _PROVIDER_CONFIG[provider]
+    key = get_secret(config["key"])
+    if provider == "Hugging Face" and not key:
+        key = get_secret("HUGGINGFACE_API_KEY")
+    return key
+
+
+def _model_supports_images(provider: str, item: dict) -> bool:
+    """Conservatively identify models that can receive image inputs."""
+    modalities = item.get("input_modalities") or item.get("modalities") or []
+    if isinstance(modalities, str):
+        modalities = re.split(r"[, +]", modalities.lower())
+    modalities = {str(value).lower() for value in modalities}
+    architecture = item.get("architecture") or {}
+    if isinstance(architecture, dict):
+        architecture_modalities = architecture.get("input_modalities") or []
+        if isinstance(architecture_modalities, str):
+            architecture_modalities = re.split(r"[, +]", architecture_modalities.lower())
+        modalities.update(str(value).lower() for value in architecture_modalities)
+        modality_text = str(architecture.get("modality", "")).lower()
+    else:
+        modality_text = str(architecture).lower()
+    pipeline = str(item.get("pipeline_tag", "")).lower()
+    model_id = str(item.get("id") or item.get("name") or "").lower()
+    explicit = "image" in modalities or "vision" in modalities
+    described = "image" in modality_text or "vision" in modality_text
+    hf_vision = pipeline in {"image-text-to-text", "visual-question-answering"}
+    known_vision_id = any(token in model_id for token in (
+        "vision", "vl-", "-vl", "llava", "qwen3.6", "qwen2-vl",
+        "qwen2.5-vl", "gemma-3", "pixtral", "internvl", "minicpm-v",
+    ))
+    if provider == "Google Gemini":
+        return (
+            "generatecontent" in {str(v).lower() for v in item.get("supported_generation_methods", [])}
+            and not any(token in model_id for token in ("embedding", "aqa", "tts"))
+        )
+    return explicit or described or hf_vision or known_vision_id
+
+
+def _normalise_provider_model(provider: str, item: dict) -> dict | None:
+    model_id = str(item.get("id") or item.get("name") or "").strip()
+    if not model_id:
+        return None
+    if model_id.startswith("models/"):
+        model_id = model_id[7:]
+    item = {**item, "id": model_id}
+    return {
+        "provider": provider,
+        "id": model_id,
+        "name": _short_label(model_id),
+        "vision": _model_supports_images(provider, item),
+        "kind": _PROVIDER_CONFIG[provider]["kind"],
+    }
+
+
+def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
+    """Fetch and return only models that are explicitly able to read images."""
+    config = _PROVIDER_CONFIG[provider]
+    headers = {"Authorization": "Bearer " + api_key}
+    params = {}
+    if provider == "Google Gemini":
+        headers = {}
+        params = {"key": api_key}
+    if provider == "Hugging Face":
+        params = {"pipeline_tag": "image-text-to-text", "limit": 200}
+    response = requests.get(
+        config["models_url"],
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    raw_models = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if provider == "Google Gemini":
+        raw_models = payload.get("models", [])
+        for item in raw_models:
+            item["supported_generation_methods"] = item.get("supportedGenerationMethods", [])
+    if not isinstance(raw_models, list):
+        raise RuntimeError("The provider returned an unexpected /models response.")
+    models = []
+    for item in raw_models:
+        if isinstance(item, str):
+            item = {"id": item}
+        if not isinstance(item, dict):
+            continue
+        model = _normalise_provider_model(provider, item)
+        if model:
+            models.append(model)
+    models.sort(key=lambda model: (model["provider"], model["name"].lower(), model["id"]))
+    if not models:
+        raise RuntimeError("The provider returned no usable models for this API key.")
+    return models
+
+
+def _active_models() -> list[dict]:
+    return list(st.session_state.get("active_models", []))
+
+
+def _model_label(model: dict) -> str:
+    return f"{model['name']} · {model['provider']}"
+
+
+def _openai_vision_request(
+    model: dict, api_key: str, image_bytes: bytes, mime: str, prompt: str
+) -> str:
+    config = _PROVIDER_CONFIG[model["provider"]]
+    data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+    response = requests.post(
+        config["chat_url"],
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model["id"],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert chart-reading AI. Return valid JSON only.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1800,
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    body = response.json()
+    try:
+        return body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("The provider returned no model response.") from exc
+
+
+def _gemini_vision_request(
+    model: dict, api_key: str, image_bytes: bytes, mime: str, prompt: str
+) -> str:
+    data = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {
+                    "inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    }
+                },
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 1800,
+            "responseMimeType": "application/json",
+        },
+    }
+    response = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + model["id"] + ":generateContent",
+        params={"key": api_key},
+        json=data,
+        timeout=90,
+    )
+    response.raise_for_status()
+    body = response.json()
+    try:
+        return body["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Gemini returned no model response.") from exc
+
+
+def _call_activated_model(
+    model: dict, image_bytes: bytes, mime: str, prompt: str
+) -> dict:
+    """Send the actual chart image to one activated model."""
+    api_key = _provider_key(model["provider"])
+    if not api_key:
+        raise RuntimeError(model["provider"] + " API key is not configured.")
+    if model["kind"] == "gemini":
+        raw = _gemini_vision_request(model, api_key, image_bytes, mime, prompt)
+    else:
+        raw = _openai_vision_request(model, api_key, image_bytes, mime, prompt)
+    result = parse_json(raw)
+    result.setdefault("model", model["name"])
+    result["_platform"] = model["provider"]
+    result["_provider"] = model["provider"]
+    result["_model_id"] = model["id"]
+    result["_active_model"] = model
+    result["vision_model"] = _model_label(model)
+    result["vision_provider"] = model["provider"]
+    return _normalise_vote_fields(
+        result, "Image analysis completed by " + model["name"] + "."
+    )
+
+
+def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
+    config = _PROVIDER_CONFIG[model["provider"]]
+    response = requests.post(
+        config["chat_url"],
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model["id"],
+            "messages": [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1200,
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    body = response.json()
+    try:
+        return body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("The provider returned no model response.") from exc
+
+
+def _call_activated_text_model(model: dict, prompt: str) -> dict:
+    api_key = _provider_key(model["provider"])
+    if not api_key:
+        raise RuntimeError(model["provider"] + " API key is not configured.")
+    if model["kind"] == "gemini":
+        # Gemini's REST API also accepts a text-only contents payload.
+        response = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            + model["id"] + ":generateContent",
+            params={"key": api_key},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "maxOutputTokens": 1200,
+                    "responseMimeType": "application/json",
+                },
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        body = response.json()
+        try:
+            raw = body["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("Gemini returned no model response.") from exc
+    else:
+        raw = _openai_text_request(model, api_key, prompt)
+    result = parse_json(raw)
+    result.setdefault("model", model["name"])
+    result["_platform"] = model["provider"]
+    result["_provider"] = model["provider"]
+    result["_model_id"] = model["id"]
+    result["_active_model"] = model
+    return _normalise_vote_fields(result, "Model completed the debate response.")
+
+
+def _call_activated_chat(
+    model: dict, image_bytes: bytes, mime: str, message: str
+) -> str:
+    prompt = (
+        "You are testing an AI trading chart reader. Carefully inspect the attached "
+        "chart image, then answer the trader's question. Mention uncertainty when "
+        "labels or indicators are not visible. Do not invent values.\n\n"
+        "Trader question:\n" + message
+    )
+    api_key = _provider_key(model["provider"])
+    if not api_key:
+        raise RuntimeError(model["provider"] + " API key is not configured.")
+    if model["kind"] == "gemini":
+        return _gemini_vision_request(model, api_key, image_bytes, mime, prompt)
+    return _openai_vision_request(model, api_key, image_bytes, mime, prompt)
+
+
+def _activated_chart_prompt(extra: str = "") -> str:
+    extra_line = ("\nTrader context: " + extra.strip()) if extra.strip() else ""
+    return (
+        "Read the attached trading chart image carefully. Every activated model "
+        "must analyze the image itself; do not rely on another model's output. "
+        "Do not invent values that are not visible. " + extra_line + "\n\n"
+        + CHART_PROMPT_TEXT + "\n" + CHART_ANALYSIS_JSON_SPEC + "\n"
+        "Also include these committee fields: "
+        '"analysis":"brief chart-based analysis",'
+        '"key_risks":["specific visible or uncertainty risk"],'
+        '"vote":"UP"|"DOWN"|"WAIT",'
+        '"confidence":0-100,'
+        '"reasoning":"one clear sentence for the vote".\n'
+        "Return ONLY valid JSON."
+    )
+
+
+def step1_analyze_active_models(
+    image_bytes: bytes, mime: str, extra: str, models: list[dict]
+) -> tuple[dict, list[dict], list[tuple[str, str]], str]:
+    """Send the original image to every activated vision model."""
+    results: list[dict] = []
+    failures: list[tuple[str, str]] = []
+    prompt = _activated_chart_prompt(extra)
+    for model in models:
+        try:
+            results.append(_call_activated_model(model, image_bytes, mime, prompt))
+        except Exception as exc:
+            failures.append((_model_label(model), str(exc)[:240]))
+
+    if not results:
+        fallback = dict(_TEXT_FALLBACK_DATA)
+        fallback["vision_provider"] = "No active vision model"
+        fallback["vision_model"] = "Offline"
+        return fallback, results, failures, "🚨 No activated vision model could read the chart."
+
+    chart_data = dict(results[0])
+    chart_data["vision_model"] = _model_label(results[0]["_active_model"])
+    chart_data["vision_provider"] = results[0]["_platform"]
+    chart_data["active_model_count"] = len(results)
+    chart_data["vision_results"] = results
+    chart_data["groq_vision_model"] = "Not used"
+    chart_data["groq_vision_vote"] = "—"
+    chart_data["groq_vision_confidence"] = 0
+    chart_data["groq_vision_reasoning"] = "Activated model results are shown below."
+    status = (
+        "✅ " + str(len(results)) + " activated vision model(s) read the chart."
+        if not failures
+        else "⚠️ " + str(len(results)) + " model(s) read the chart; "
+        + str(len(failures)) + " failed."
+    )
+    return chart_data, results, failures, status
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +703,7 @@ def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
         + "\n\nNote: Fill live_news with your best knowledge of recent market events."
     )
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL_ID,
         contents=[
             prompt,
             types.Part.from_bytes(data=image_bytes, mime_type=mime),
@@ -301,14 +715,13 @@ def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
         ),
     )
     result = parse_json(response.text or "")
-    result["vision_model"] = "Gemini 2.5 Flash"
+    result["vision_model"] = GEMINI_MODEL_LABEL
     result["vision_provider"] = "Gemini"
-    result["gemini_vision_model"] = "Gemini 2.5 Flash"
-    result["gemini_vision_vote"] = result.get("vote") or "WAIT"
-    result["gemini_vision_confidence"] = result.get("confidence") or 50
-    result["gemini_vision_reasoning"] = (
-        result.get("reasoning") or "Gemini chart analysis."
-    )
+    result["gemini_vision_model"] = GEMINI_MODEL_LABEL
+    _normalise_vote_fields(result, "Gemini chart analysis.")
+    result["gemini_vision_vote"] = result["vote"]
+    result["gemini_vision_confidence"] = result["confidence"]
+    result["gemini_vision_reasoning"] = result["reasoning"]
     return result
 
 
@@ -357,13 +770,7 @@ def _groq_vision(image_bytes: bytes, mime: str, extra: str,
     result = parse_json(response.choices[0].message.content)
     result["vision_model"] = model_label
     result["vision_provider"] = "Groq"
-    # Normalise — model may return "vote" or "gemini_vote"; expose both consistently
-    vote = result.get("vote") or result.get("gemini_vote") or "WAIT"
-    conf = result.get("confidence") or result.get("gemini_confidence") or 50
-    rsn  = result.get("reasoning") or result.get("gemini_reasoning") or "Groq vision analysis."
-    result["vote"]       = vote
-    result["confidence"] = conf
-    result["reasoning"]  = rsn
+    _normalise_vote_fields(result, "Groq vision analysis.")
     return result
 
 
@@ -444,20 +851,9 @@ def _inject_real_news(chart_data: dict) -> dict:
 
 def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict, str]:
     """
-    Runs Gemini first, then Groq vision as a fallback.
+    Runs the current live Groq vision model.
     Returns (chart_data, status_message). Never raises.
     """
-    gemini_error = ""
-    try:
-        chart_data = _gemini_vision(image_bytes, mime, extra)
-        chart_data["groq_vision_model"] = "Not used"
-        chart_data["groq_vision_vote"] = "—"
-        chart_data["groq_vision_confidence"] = 0
-        chart_data["groq_vision_reasoning"] = "Gemini completed the primary vision pass."
-        return chart_data, "✅ **Gemini 2.5 Flash** analyzed the chart."
-    except Exception as exc:
-        gemini_error = str(exc)[:160]
-
     groq_data       = None
     groq_error      = ""
     groq_model_used = ""
@@ -486,8 +882,8 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
         chart_data["groq_vision_reasoning"]  = "Vision API unavailable."
         chart_data["vision_provider"]        = "Text fallback"
         status = (
-            "🚨 **Gemini and Groq vision unavailable** — text-fallback mode.\n\n"
-            "Gemini: " + gemini_error + "\nGroq: " + groq_error[:220]
+            "🚨 **Groq vision unavailable** — text-fallback mode.\n\n"
+            "Groq: " + groq_error[:220]
         )
 
     return chart_data, status
@@ -680,10 +1076,10 @@ def _call_gemini(chart_data: dict) -> dict:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-    prompt = build_analyst_prompt("Gemini 2.5 Flash", chart_data)
+    prompt = build_analyst_prompt(GEMINI_MODEL_LABEL, chart_data)
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL_ID,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.4,
@@ -692,9 +1088,9 @@ def _call_gemini(chart_data: dict) -> dict:
         ),
     )
     result = parse_json(response.text or "")
-    result.setdefault("model", "Gemini 2.5 Flash")
+    result.setdefault("model", GEMINI_MODEL_LABEL)
     result["_platform"] = "Gemini"
-    result["_model_id"] = "gemini-2.5-flash"
+    result["_model_id"] = GEMINI_MODEL_ID
     return result
 
 
@@ -773,7 +1169,7 @@ def _call_gemini_raw(model_name: str, prompt: str) -> dict:
 
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=GEMINI_MODEL_ID,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0.3,
@@ -784,7 +1180,7 @@ def _call_gemini_raw(model_name: str, prompt: str) -> dict:
     result = parse_json(response.text or "")
     result.setdefault("model", model_name)
     result["_platform"] = "Gemini"
-    result["_model_id"] = "gemini-2.5-flash"
+    result["_model_id"] = GEMINI_MODEL_ID
     return result
 
 
@@ -1685,125 +2081,109 @@ def render_trade_recommendation(synth: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar — Custom AI Model Manager
+# Sidebar — secure provider/model manager
 # ─────────────────────────────────────────────────────────────────────────────
+if "provider_keys" not in st.session_state:
+    st.session_state["provider_keys"] = {}
+if "active_models" not in st.session_state:
+    st.session_state["active_models"] = []
+if "provider_errors" not in st.session_state:
+    st.session_state["provider_errors"] = {}
 if "custom_models" not in st.session_state:
     st.session_state["custom_models"] = []
+
+# Keep the existing server-side Groq setup useful on first load, while all
+# discovered models still pass through the image-capability filter.
+if not st.session_state["active_models"] and get_secret("GROQ_API_KEY"):
+    try:
+        st.session_state["provider_keys"]["GROQ_API_KEY"] = get_secret("GROQ_API_KEY")
+        st.session_state["active_models"] = _discover_provider_models(
+            "Groq", get_secret("GROQ_API_KEY")
+        )
+    except Exception as exc:
+        st.session_state["provider_errors"]["Groq"] = str(exc)[:240]
 
 with st.sidebar:
     st.markdown(
         "<h2 style='font-size:1.1rem;font-weight:800;color:#c8d6e8;"
-        "border-bottom:1px solid #1a2340;padding-bottom:8px;margin-bottom:12px;'>"
-        "🧩 AI Model Manager</h2>",
+        "border-bottom:1px solid #1a2340;padding-bottom:8px;margin-bottom:8px;'>"
+        "🧩 AI Model Configuration</h2>",
         unsafe_allow_html=True,
     )
-
-    # ── Section 1: Live catalog browser ───────────────────────────────
-    st.markdown(
-        "<p style='font-size:.75rem;font-weight:700;color:#8090a8;"
-        "text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;'>"
-        "⚡ Live Groq Catalog</p>",
-        unsafe_allow_html=True,
+    st.caption(
+        "Keys stay in this server session. Connect a provider to discover and "
+        "activate every image-capable model available to that key."
     )
-
-    @st.cache_data(ttl=120, show_spinner=False)
-    def _get_full_catalog() -> list[tuple[str, str]]:
-        return _discover_groq_text_models(n=12)
-
-    catalog   = _get_full_catalog()
-    catalog_ids  = [mid for mid, _ in catalog]
-    auto_ids     = catalog_ids[:3]
-    already_custom = st.session_state.get("custom_models", [])
-    addable      = [mid for mid in catalog_ids
-                    if mid not in auto_ids and mid not in already_custom]
-
-    for mid in auto_ids:
-        st.markdown(
-            "<div class='catalog-row'>"
-            "<span style='color:#00ff88;font-size:.8rem;'>✅</span>"
-            "<span style='flex:1;margin:0 6px;font-size:.78rem;color:#a0b8d0;'>"
-            + _short_label(mid) + "</span>"
-            "<span style='font-size:.6rem;color:#2a5040;background:#0a1e14;"
-            "padding:1px 5px;border-radius:4px;'>AUTO</span>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    st.markdown(
-        "<p style='font-size:.68rem;color:#2a3a50;margin:4px 0 0;'>"
-        "🔄 Auto-refreshed every 2 min from Groq's live API</p>",
-        unsafe_allow_html=True,
+    provider = st.selectbox(
+        "AI provider / aggregator",
+        list(_PROVIDER_CONFIG),
+        format_func=lambda value: {
+            "OpenRouter": "OpenRouter · recommended",
+            "Groq": "Groq",
+            "Together AI": "Together AI",
+            "Google Gemini": "Google Gemini",
+            "Hugging Face": "Hugging Face",
+        }[value],
+        key="manager_provider",
     )
-
-    # Quick-add from remaining discovered models
-    if addable:
-        st.markdown(
-            "<p style='font-size:.75rem;font-weight:700;color:#8090a8;"
-            "text-transform:uppercase;letter-spacing:.06em;margin:12px 0 4px;'>"
-            "➕ Quick-Add from Catalog</p>",
-            unsafe_allow_html=True,
+    with st.form("provider_connection_form", clear_on_submit=True):
+        api_key_input = st.text_input(
+            "API key",
+            type="password",
+            placeholder="Paste a key to discover models",
+            help="The key is used only by the server to call this provider's models endpoint.",
         )
-        quick_pick = st.selectbox(
-            "pick_model",
-            ["— choose a model —"] + [_short_label(m) + "  |  " + m for m in addable],
-            label_visibility="collapsed",
+        connect = st.form_submit_button(
+            "🔐 Connect & discover models", type="primary", use_container_width=True
         )
-        if st.button("Add Selected ➕", use_container_width=True):
-            if quick_pick and "—" not in quick_pick:
-                picked_id = quick_pick.split("  |  ")[-1].strip()
-                if picked_id not in st.session_state["custom_models"]:
-                    st.session_state["custom_models"].append(picked_id)
+    if connect:
+        if not api_key_input.strip():
+            st.error("Paste an API key first.")
+        else:
+            with st.spinner("Validating key and discovering image-capable models…"):
+                try:
+                    discovered = _discover_provider_models(provider, api_key_input.strip())
+                    st.session_state["provider_keys"][
+                        _PROVIDER_CONFIG[provider]["key"]
+                    ] = api_key_input.strip()
+                    st.session_state["active_models"] = [
+                        model for model in st.session_state["active_models"]
+                        if model["provider"] != provider
+                    ] + discovered
+                    st.session_state["provider_errors"].pop(provider, None)
+                    st.success(
+                        f"Activated {len(discovered)} image-capable "
+                        f"{provider} model(s)."
+                    )
                     st.rerun()
+                except Exception as exc:
+                    message = str(exc)
+                    st.session_state["provider_errors"][provider] = message[:240]
+                    st.error("Could not connect: " + message[:240])
 
-    # ── Section 2: Manual model ID entry ──────────────────────────────
-    st.markdown("---")
-    st.markdown(
-        "<p style='font-size:.75rem;font-weight:700;color:#8090a8;"
-        "text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;'>"
-        "🤖 Add Any Model Manually</p>",
-        unsafe_allow_html=True,
-    )
-
-    custom_input = st.text_input(
-        "Groq Model ID",
-        key="custom_model_input",
-        placeholder="e.g. meta-llama/llama-4-maverick…",
-        label_visibility="collapsed",
-    )
-    if st.button("➕ Add to Committee", use_container_width=True):
-        cid = (custom_input or "").strip()
-        if cid and cid not in st.session_state["custom_models"]:
-            st.session_state["custom_models"].append(cid)
-            st.rerun()
-
-    # ── Section 3: Active custom models ───────────────────────────────
-    if st.session_state["custom_models"]:
-        st.markdown(
-            "<p style='font-size:.75rem;color:#566880;margin:10px 0 4px;'>"
-            "Your custom analysts:</p>",
-            unsafe_allow_html=True,
+    connected = sorted({model["provider"] for model in _active_models()})
+    if connected:
+        st.markdown("**Active vision committee**")
+        st.caption(
+            f"{len(_active_models())} models active · "
+            + ", ".join(connected)
         )
-        for i, mid in enumerate(list(st.session_state["custom_models"])):
-            c1, c2 = st.columns([5, 1])
-            c1.markdown(
-                "<div class='custom-model-tag'>🤖 " + _short_label(mid) + "</div>",
+        for index, model in enumerate(_active_models()):
+            left, right = st.columns([5, 1])
+            left.markdown(
+                "<div class='custom-model-tag'>✅ "
+                + escape(_model_label(model))
+                + "</div>",
                 unsafe_allow_html=True,
             )
-            if c2.button("✕", key="rm_" + str(i), help="Remove"):
-                st.session_state["custom_models"].pop(i)
+            if right.button("✕", key=f"remove_active_model_{index}", help="Remove model"):
+                st.session_state["active_models"].pop(index)
                 st.rerun()
     else:
-        st.markdown(
-            "<p style='font-size:.78rem;color:#1e2e40;font-style:italic;margin-top:8px;'>"
-            "No custom models added yet.</p>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-    st.markdown(
-        "<p style='font-size:.7rem;color:#1e2e40;'>"
-        "Gemini 2.5 Flash &amp; DeepSeek-Chat always participate automatically.<br>"
-        "All added models use the same JSON vote rules.</p>",
-        unsafe_allow_html=True,
+        st.info("No models active yet. Connect OpenRouter or another provider above.")
+    st.caption(
+        "Text-only models are intentionally excluded: every active committee model "
+        "must receive and read the uploaded picture."
     )
 
 
@@ -1906,6 +2286,8 @@ with st.spinner("⚡ Discovering active Groq text models…"):
     _groq_text_models = _discover_groq_text_models(n=3)
 
 _groq_labels = ", ".join(_short_label(mid) for mid, _ in _groq_text_models)
+if not _groq_labels:
+    _groq_labels = "No Groq text models available"
 _custom_count = len(st.session_state["custom_models"])
 _extra_note   = (f" + {_custom_count} custom" if _custom_count else "")
 st.markdown(
@@ -1915,11 +2297,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Build the analyst roster: auto-discovered + DeepSeek + user-added custom models
+# Build the analyst roster from the live Groq catalog and user-added custom models.
+# Gemini and DeepSeek are intentionally not included.
 ANALYST_MODELS: list[tuple[str, str, str]] = (
-    [("gemini", "gemini-2.5-flash", "Gemini 2.5 Flash")]
-    + [("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models]
-    + [("deepseek", "", "DeepSeek-Chat")]
+    [("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models]
     + [("groq", mid, mid) for mid in st.session_state["custom_models"]]
 )
 
