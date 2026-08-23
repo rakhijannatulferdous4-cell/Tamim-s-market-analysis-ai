@@ -18,6 +18,7 @@ from html import escape
 import json
 import os
 import re
+import time
 
 import requests
 import streamlit as st
@@ -348,6 +349,29 @@ def _normalise_provider_model(provider: str, item: dict) -> dict | None:
     }
 
 
+def _model_is_chat_capable(model_id: str, item: dict) -> bool:
+    """Keep catalog entries that can actually answer a debate prompt."""
+    identifier = model_id.lower()
+    blocked = (
+        "whisper", "embed", "embedding", "rerank", "moderation",
+        "safety", "tts", "text-to-speech", "image-generation",
+        "flux", "stable-diffusion", "prompt-guard", "prompt_guard",
+        "orpheus",
+    )
+    if any(token in identifier for token in blocked):
+        return False
+    capabilities = item.get("capabilities") or item.get("supported_generation_methods") or []
+    if isinstance(capabilities, str):
+        capabilities = [capabilities]
+    if capabilities and not any(
+        token in str(cap).lower()
+        for cap in capabilities
+        for token in ("chat", "generate", "completion", "generatecontent")
+    ):
+        return False
+    return True
+
+
 def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
     """Fetch the provider's usable model catalog, retaining text-only models."""
     config = _PROVIDER_CONFIG[provider]
@@ -380,7 +404,7 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
         if not isinstance(item, dict):
             continue
         model = _normalise_provider_model(provider, item)
-        if model:
+        if model and _model_is_chat_capable(model["id"], item):
             models.append(model)
     models.sort(key=lambda model: (model["provider"], model["name"].lower(), model["id"]))
     if not models:
@@ -497,23 +521,34 @@ def _call_activated_model(
 
 def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
     config = _PROVIDER_CONFIG[model["provider"]]
-    response = requests.post(
-        config["chat_url"],
-        headers={
-            "Authorization": "Bearer " + api_key,
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model["id"],
-            "messages": [
-                {"role": "system", "content": "Return valid JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 1200,
-        },
-        timeout=90,
-    )
+    payload = {
+        "model": model["id"],
+        "messages": [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 700,
+    }
+    response = None
+    for attempt in range(4):
+        response = requests.post(
+            config["chat_url"],
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=90,
+        )
+        if response.status_code != 429 or attempt == 3:
+            break
+        retry_after = response.headers.get("retry-after", "")
+        try:
+            delay = min(max(float(retry_after), 2.0), 30.0)
+        except ValueError:
+            delay = 5.0 * (attempt + 1)
+        time.sleep(delay)
     response.raise_for_status()
     body = response.json()
     try:
@@ -885,6 +920,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
     if groq_data:
         chart_data = groq_data
         chart_data["groq_vision_model"]      = groq_model_used
+        chart_data["_vision_model_id"]       = groq_model_used
         chart_data["groq_vision_vote"]       = groq_data.get("vote", "WAIT")
         chart_data["groq_vision_confidence"] = groq_data.get("confidence", 50)
         chart_data["groq_vision_reasoning"]  = groq_data.get("reasoning", "")
@@ -894,6 +930,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
         if extra.strip():
             chart_data["technical_summary"] += "  User context: " + extra.strip()
         chart_data["groq_vision_model"]      = "Groq Vision"
+        chart_data["_vision_model_id"]       = ""
         chart_data["groq_vision_vote"]       = "Offline"
         chart_data["groq_vision_confidence"] = 0
         chart_data["groq_vision_reasoning"]  = "Vision API unavailable."
@@ -2110,6 +2147,18 @@ if "provider_errors" not in st.session_state:
     st.session_state["provider_errors"] = {}
 if "custom_models" not in st.session_state:
     st.session_state["custom_models"] = []
+if not st.session_state["available_models"] and st.session_state["active_models"]:
+    st.session_state["available_models"] = list(st.session_state["active_models"])
+# A prior session may contain catalog entries that the current capability
+# filter no longer considers callable through chat completions.
+st.session_state["available_models"] = [
+    model for model in st.session_state["available_models"]
+    if _model_is_chat_capable(model.get("id", ""), model)
+]
+st.session_state["active_models"] = [
+    model for model in st.session_state["active_models"]
+    if _model_is_chat_capable(model.get("id", ""), model)
+]
 
 # Keep the existing server-side Groq setup useful on first load.
 if not st.session_state["active_models"] and get_secret("GROQ_API_KEY"):
@@ -2130,7 +2179,7 @@ with st.sidebar:
     )
     st.caption(
         "Keys stay in this server session. Connect a provider to discover and "
-        "activate every image-capable model available to that key."
+        "activate every usable chat model available to that key."
     )
     provider = st.selectbox(
         "AI provider / aggregator",
@@ -2158,7 +2207,7 @@ with st.sidebar:
         if not api_key_input.strip():
             st.error("Paste an API key first.")
         else:
-            with st.spinner("Validating key and discovering image-capable models…"):
+            with st.spinner("Validating key and discovering usable chat models…"):
                 try:
                     discovered = _discover_provider_models(provider, api_key_input.strip())
                     st.session_state["provider_keys"][
@@ -2325,7 +2374,21 @@ for model in active_models:
     model_name = _model_label(model)
     with st.spinner(_model_icon(model_name) + " " + model_name + " is analysing…"):
         try:
-            if model.get("vision"):
+            if model.get("vision") and model.get("id") == chart_data.get("_vision_model_id"):
+                # The primary vision pass is already this model's answer. Reuse it
+                # instead of spending a second request and triggering provider rate limits.
+                result = {
+                    **chart_data,
+                    "model": model["name"],
+                    "_platform": model["provider"],
+                    "_provider": model["provider"],
+                    "_model_id": model["id"],
+                    "_active_model": model,
+                }
+                result = _normalise_vote_fields(
+                    result, "The uploaded chart was read by " + model["name"] + "."
+                )
+            elif model.get("vision"):
                 result = _call_activated_model(
                     model, image_bytes, mime_type, _activated_chart_prompt(extra_ctx)
                 )

@@ -14,9 +14,4 @@ run = "cd artifacts/trading-debate && python -m streamlit run main.py --server.p
 
 
 [services.production]
-
-[services.production.run]
-args = ["python", "-m", "streamlit", "run", "artifacts/trading-debate/main.py", "--server.address", "0.0.0.0", "--server.headless", "true", "--server.enableCORS", "false", "--server.port", "8000"]
-
-[services.production.run.env]
-PORT = "8000"
+run = "cd artifacts/trading-debate && python -m streamlit run main.py --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.port 8000"

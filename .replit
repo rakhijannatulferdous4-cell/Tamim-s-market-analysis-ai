@@ -3,6 +3,7 @@ modules = ["nodejs-24", "python-3.11"]
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
+run = ["streamlit", "run", "--server.address", "0.0.0.0", "--server.headless", "true", "--server.enableCORS=false", "--server.enableWebsocketCompression=false", "artifacts/trading-debate/main.py"]
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]

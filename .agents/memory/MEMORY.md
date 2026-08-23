@@ -1,1 +1,2 @@
 - [Gemini Python SDK](gemini-python-sdk.md) — Use the maintained `google-genai` SDK for Gemini calls; avoid the deprecated `google.generativeai` package.
+- [Model roster runtime](model-roster-runtime.md) — Filter provider catalogs to chat-capable entries and avoid duplicate vision calls that trigger rate limits.
