@@ -349,7 +349,7 @@ def _normalise_provider_model(provider: str, item: dict) -> dict | None:
 
 
 def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
-    """Fetch and return only models that are explicitly able to read images."""
+    """Fetch the provider's usable model catalog, retaining text-only models."""
     config = _PROVIDER_CONFIG[provider]
     headers = {"Authorization": "Bearer " + api_key}
     params = {}
@@ -357,7 +357,7 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
         headers = {}
         params = {"key": api_key}
     if provider == "Hugging Face":
-        params = {"pipeline_tag": "image-text-to-text", "limit": 200}
+        params = {"limit": 200}
     response = requests.get(
         config["models_url"],
         headers=headers,
@@ -474,7 +474,7 @@ def _gemini_vision_request(
 def _call_activated_model(
     model: dict, image_bytes: bytes, mime: str, prompt: str
 ) -> dict:
-    """Send the actual chart image to one activated model."""
+    """Send the image to vision models; text models are handled separately."""
     api_key = _provider_key(model["provider"])
     if not api_key:
         raise RuntimeError(model["provider"] + " API key is not configured.")
@@ -628,6 +628,23 @@ def step1_analyze_active_models(
         + str(len(failures)) + " failed."
     )
     return chart_data, results, failures, status
+
+
+def _activated_vote_prompt(chart_data: dict, extra: str = "") -> str:
+    """Give text-only models the structured output of the vision pass honestly."""
+    safe_data = {
+        key: value for key, value in chart_data.items()
+        if key not in {"vision_results", "_active_model"}
+    }
+    return (
+        "You are an independent trading analyst. A vision model already inspected "
+        "the uploaded chart and produced the structured chart record below. Use only "
+        "that record; do not claim that you personally saw pixels. Return valid JSON "
+        "with vote UP, DOWN, or WAIT, confidence 0-100, analysis, key_risks, and "
+        "reasoning. Be specific and acknowledge uncertainty.\n\n"
+        "CHART RECORD:\n" + json.dumps(safe_data, ensure_ascii=False, default=str)
+        + ("\nTRADER CONTEXT:\n" + extra.strip() if extra.strip() else "")
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2087,19 +2104,20 @@ if "provider_keys" not in st.session_state:
     st.session_state["provider_keys"] = {}
 if "active_models" not in st.session_state:
     st.session_state["active_models"] = []
+if "available_models" not in st.session_state:
+    st.session_state["available_models"] = []
 if "provider_errors" not in st.session_state:
     st.session_state["provider_errors"] = {}
 if "custom_models" not in st.session_state:
     st.session_state["custom_models"] = []
 
-# Keep the existing server-side Groq setup useful on first load, while all
-# discovered models still pass through the image-capability filter.
+# Keep the existing server-side Groq setup useful on first load.
 if not st.session_state["active_models"] and get_secret("GROQ_API_KEY"):
     try:
         st.session_state["provider_keys"]["GROQ_API_KEY"] = get_secret("GROQ_API_KEY")
-        st.session_state["active_models"] = _discover_provider_models(
-            "Groq", get_secret("GROQ_API_KEY")
-        )
+        discovered = _discover_provider_models("Groq", get_secret("GROQ_API_KEY"))
+        st.session_state["available_models"] = discovered
+        st.session_state["active_models"] = discovered
     except Exception as exc:
         st.session_state["provider_errors"]["Groq"] = str(exc)[:240]
 
@@ -2146,14 +2164,17 @@ with st.sidebar:
                     st.session_state["provider_keys"][
                         _PROVIDER_CONFIG[provider]["key"]
                     ] = api_key_input.strip()
+                    st.session_state["available_models"] = [
+                        model for model in st.session_state["available_models"]
+                        if model["provider"] != provider
+                    ] + discovered
                     st.session_state["active_models"] = [
                         model for model in st.session_state["active_models"]
                         if model["provider"] != provider
                     ] + discovered
                     st.session_state["provider_errors"].pop(provider, None)
                     st.success(
-                        f"Activated {len(discovered)} image-capable "
-                        f"{provider} model(s)."
+                        f"Discovered and activated {len(discovered)} {provider} model(s)."
                     )
                     st.rerun()
                 except Exception as exc:
@@ -2161,29 +2182,34 @@ with st.sidebar:
                     st.session_state["provider_errors"][provider] = message[:240]
                     st.error("Could not connect: " + message[:240])
 
-    connected = sorted({model["provider"] for model in _active_models()})
+    connected = sorted({model["provider"] for model in st.session_state["available_models"]})
     if connected:
-        st.markdown("**Active vision committee**")
+        st.markdown("**Active model committee**")
         st.caption(
             f"{len(_active_models())} models active · "
             + ", ".join(connected)
         )
-        for index, model in enumerate(_active_models()):
-            left, right = st.columns([5, 1])
-            left.markdown(
-                "<div class='custom-model-tag'>✅ "
-                + escape(_model_label(model))
-                + "</div>",
-                unsafe_allow_html=True,
-            )
-            if right.button("✕", key=f"remove_active_model_{index}", help="Remove model"):
-                st.session_state["active_models"].pop(index)
-                st.rerun()
+        with st.expander("Manage active models", expanded=True):
+            active_ids = {model["provider"] + ":" + model["id"] for model in _active_models()}
+            for model in st.session_state["available_models"]:
+                model_key = model["provider"] + ":" + model["id"]
+                checked = st.checkbox(
+                    _model_label(model) + (" · vision" if model.get("vision") else " · text"),
+                    value=model_key in active_ids,
+                    key="activate_" + re.sub(r"[^a-zA-Z0-9_]", "_", model_key),
+                )
+                if checked and model_key not in active_ids:
+                    st.session_state["active_models"].append(model)
+                elif not checked and model_key in active_ids:
+                    st.session_state["active_models"] = [
+                        item for item in st.session_state["active_models"]
+                        if item["provider"] + ":" + item["id"] != model_key
+                    ]
     else:
         st.info("No models active yet. Connect OpenRouter or another provider above.")
     st.caption(
-        "Text-only models are intentionally excluded: every active committee model "
-        "must receive and read the uploaded picture."
+        "Vision models receive the picture directly. Text-only models receive the "
+        "structured chart record extracted from the picture."
     )
 
 
@@ -2255,7 +2281,7 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("<div class='step-header'>Step 1 — Chart Analysis & Market News</div>",
             unsafe_allow_html=True)
-with st.spinner("🔍 Reading chart…  Gemini primary → Groq vision fallback…"):
+with st.spinner("🔍 Reading chart… Groq vision model…"):
     chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
 
 asset_name = chart_data.get("asset", "asset")
@@ -2282,40 +2308,31 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.spinner("⚡ Discovering active Groq text models…"):
-    _groq_text_models = _discover_groq_text_models(n=3)
-
-_groq_labels = ", ".join(_short_label(mid) for mid, _ in _groq_text_models)
-if not _groq_labels:
-    _groq_labels = "No Groq text models available"
-_custom_count = len(st.session_state["custom_models"])
-_extra_note   = (f" + {_custom_count} custom" if _custom_count else "")
+active_models = _active_models()
+_model_labels = ", ".join(_model_label(model) for model in active_models)
+if not _model_labels:
+    _model_labels = "No active models"
 st.markdown(
     "<p style='font-size:.8rem;color:#566880;margin-bottom:12px;'>"
-    "🤖 Auto-selected: <strong style='color:#a0b8d0;'>" + _groq_labels + "</strong>"
-    + _extra_note + "</p>",
+    "🤖 Active roster: <strong style='color:#a0b8d0;'>" + escape(_model_labels) + "</strong></p>",
     unsafe_allow_html=True,
-)
-
-# Build the analyst roster from the live Groq catalog and user-added custom models.
-# Gemini and DeepSeek are intentionally not included.
-ANALYST_MODELS: list[tuple[str, str, str]] = (
-    [("groq", mid, _short_label(mid)) for mid, _ in _groq_text_models]
-    + [("groq", mid, mid) for mid in st.session_state["custom_models"]]
 )
 
 analyst_votes:  list[dict] = []
 offline_models: list[str]  = []
 
-for backend, model_id, model_name in ANALYST_MODELS:
+for model in active_models:
+    model_name = _model_label(model)
     with st.spinner(_model_icon(model_name) + " " + model_name + " is analysing…"):
         try:
-            if backend == "gemini":
-                result = _call_gemini(chart_data)
-            elif backend == "groq":
-                result = _call_groq(model_id, model_name, chart_data)
+            if model.get("vision"):
+                result = _call_activated_model(
+                    model, image_bytes, mime_type, _activated_chart_prompt(extra_ctx)
+                )
             else:
-                result = _call_deepseek(chart_data)
+                result = _call_activated_text_model(
+                    model, _activated_vote_prompt(chart_data, extra_ctx)
+                )
             analyst_votes.append(result)
             render_vote_card(result, status="online")
         except Exception as exc:
@@ -2341,7 +2358,7 @@ render_deliberation_round(analyst_votes, revised_votes)
 # STEP 3 — Cross-examination & final verdict (uses post-deliberation votes)
 # ══════════════════════════════════════════════════════════════════════════════
 n_online = 1 + len(revised_votes)
-n_total  = 1 + len(ANALYST_MODELS)
+n_total  = 1 + len(active_models)
 st.markdown("---")
 st.markdown(
     "<div class='step-header'>Step 3 — Cross-Examination & Final Verdict"
