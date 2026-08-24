@@ -403,6 +403,8 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
             item = {"id": item}
         if not isinstance(item, dict):
             continue
+        if item.get("active") is False:
+            continue
         model = _normalise_provider_model(provider, item)
         if model and _model_is_chat_capable(model["id"], item):
             models.append(model)
@@ -414,6 +416,16 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
 
 def _active_models() -> list[dict]:
     return list(st.session_state.get("active_models", []))
+
+
+def _retire_model(model: dict) -> None:
+    """Remove a model that proved unavailable from both active and catalog lists."""
+    identity = (model.get("provider"), model.get("id"))
+    for state_key in ("active_models", "available_models"):
+        st.session_state[state_key] = [
+            item for item in st.session_state.get(state_key, [])
+            if (item.get("provider"), item.get("id")) != identity
+        ]
 
 
 def _model_label(model: dict) -> str:
@@ -1349,15 +1361,9 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
     asset      = chart_data.get("asset", "the asset")
     user_ctx   = (chart_data.get("user_context") or "").strip()
 
-    positions = (
-        chart_data.get("vision_model", "Vision Model").split("/")[-1] + " (Vision): "
-        + chart_data.get("gemini_vision_vote",
-                          chart_data.get("groq_vision_vote", "WAIT"))
-        + " (" + str(chart_data.get("gemini_vision_confidence",
-                                    chart_data.get("groq_vision_confidence", 0))) + "%) — "
-        + chart_data.get("gemini_vision_reasoning",
-                         chart_data.get("groq_vision_reasoning", "")) + "\n"
-    )
+    # The vision model is also an active analyst. Do not add a second,
+    # duplicate vision position here; every active model must count once.
+    positions = ""
     for v in analyst_votes:
         positions += (
             v.get("model", "?") + ": " + v.get("vote", "WAIT")
@@ -1367,10 +1373,7 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
             "  Key Risks : " + ", ".join(v.get("key_risks", [])) + "\n"
         )
 
-    online_names = (
-        [chart_data.get("vision_model", "Vision Model").split("/")[-1]]
-        + [v.get("model", "?") for v in analyst_votes]
-    )
+    online_names = [v.get("model", "?") for v in analyst_votes]
 
     # Build a concrete hold-duration guide based on the real timeframe
     if tf_minutes > 0:
@@ -1459,11 +1462,97 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
             )
             result = parse_json(chat.choices[0].message.content)
             result["_synth_model"] = label + " (Groq)"
-            return result
+            return _normalise_synthesis(result, chart_data, analyst_votes)
         except Exception as e:
             last_err = str(e)
             continue
-    raise RuntimeError("Synthesis failed — " + last_err)
+    # A provider outage must not erase the committee's usable answer.
+    return _normalise_synthesis({}, chart_data, analyst_votes, last_err)
+
+
+def _normalise_synthesis(
+    result: dict,
+    chart_data: dict,
+    analyst_votes: list[dict],
+    error: str = "",
+) -> dict:
+    """Make the displayed verdict agree with the actual active-model tally."""
+    tally = {"UP": 0, "DOWN": 0, "WAIT": 0}
+    for vote in analyst_votes:
+        value = _normalise_vote_fields(dict(vote), "Vote recorded.")["vote"]
+        tally[value] = tally.get(value, 0) + 1
+
+    ordered = sorted(tally.items(), key=lambda item: item[1], reverse=True)
+    leader, leader_count = ordered[0] if ordered else ("WAIT", 0)
+    second_count = ordered[1][1] if len(ordered) > 1 else 0
+    total = sum(tally.values())
+    # A strict plurality is enough for a directional committee decision;
+    # a tie remains WAIT rather than inventing conviction.
+    decision = leader if leader_count > second_count and leader_count else "WAIT"
+    confidence = int(round(100 * leader_count / total)) if total else 0
+    existing_tally = result.get("vote_tally")
+    if not isinstance(existing_tally, dict):
+        existing_tally = {}
+
+    result["vote_tally"] = {
+        key: int(existing_tally.get(key, tally[key]) or tally[key])
+        for key in ("UP", "DOWN", "WAIT")
+    }
+    # The source-of-truth tally must win over an LLM's malformed or stale count.
+    result["vote_tally"] = tally
+    result["FINAL_DECISION"] = decision
+    result["confidence"] = max(0, min(100, int(result.get("confidence", confidence) or confidence)))
+    if not result["confidence"]:
+        result["confidence"] = confidence
+    result["consensus_strength"] = result.get(
+        "consensus_strength"
+    ) or (
+        "STRONG" if total and leader_count / total >= 0.7
+        else ("MODERATE" if decision != "WAIT" else "DIVIDED")
+    )
+    result["cross_examination"] = result.get(
+        "cross_examination"
+    ) or (
+        f"The committee recorded {tally['UP']} UP, {tally['DOWN']} DOWN, "
+        f"and {tally['WAIT']} WAIT positions. "
+        f"{decision} leads by the current weight of evidence."
+    )
+    result["moderator_note"] = result.get(
+        "moderator_note"
+    ) or (
+        f"Final committee signal: {decision}. Review the chart levels, "
+        "risk controls, and current market conditions before acting."
+        if decision != "WAIT"
+        else "The committee is divided or lacks a clear edge. Wait for confirmation "
+        "from price action before entering a position."
+    )
+    action = result.get("recommended_action")
+    if not isinstance(action, dict):
+        action = {}
+    action.setdefault("should_trade", decision in {"UP", "DOWN"})
+    action.setdefault("trade_direction", decision if decision in {"UP", "DOWN"} else None)
+    action.setdefault("candle_count", 3 if decision in {"UP", "DOWN"} else None)
+    minutes = int(chart_data.get("timeframe_minutes", 0) or 0)
+    action.setdefault(
+        "total_duration_minutes",
+        (3 * minutes) if decision in {"UP", "DOWN"} and minutes else None,
+    )
+    action.setdefault(
+        "dont_trade_reason",
+        None if decision in {"UP", "DOWN"} else "No clear majority signal.",
+    )
+    action.setdefault(
+        "display_text",
+        (
+            f"{decision} signal — confirm entry with risk controls."
+            if decision in {"UP", "DOWN"}
+            else "WAIT — no clear majority signal.",
+        ),
+    )
+    result["recommended_action"] = action
+    if error:
+        result.setdefault("_synth_error", error[:240])
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1910,24 +1999,9 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
     st.markdown("<div class='step-header'>🗳️ All AI Votes at a Glance</div>",
                 unsafe_allow_html=True)
 
-    # Vision model always gets its own scoreboard tile
-    vision_model = chart_data.get("vision_model", "Vision Model")
-    vision_provider = chart_data.get("vision_provider", "Vision AI")
-    entries = [
-        {
-            "model":    vision_model.split("/")[-1],
-            "vote":     chart_data.get(
-                "gemini_vision_vote",
-                chart_data.get("groq_vision_vote", "Offline"),
-            ),
-            "conf":     chart_data.get(
-                "gemini_vision_confidence",
-                chart_data.get("groq_vision_confidence", 0),
-            ),
-            "icon":     "✨" if vision_provider == "Gemini" else "⚡",
-            "platform": vision_provider,
-        },
-    ] + [{
+    # Each active model appears exactly once; the vision model is included
+    # through analyst_votes after its primary chart pass.
+    entries = [{
         "model":    v.get("model", "?"),
         "vote":     v.get("vote",  "WAIT"),
         "conf":     v.get("confidence", 0),
@@ -2095,8 +2169,8 @@ def render_trade_recommendation(synth: dict) -> None:
         return
 
     should_trade = ra.get("should_trade", False)
-    display_text = ra.get("display_text", "")
-    direction    = ra.get("trade_direction") or ""
+    display_text = str(ra.get("display_text") or "")
+    direction    = str(ra.get("trade_direction") or "").upper()
     candles      = ra.get("candle_count")
     total_mins   = ra.get("total_duration_minutes")
     no_trade_rsn = ra.get("dont_trade_reason") or ""
@@ -2106,10 +2180,10 @@ def render_trade_recommendation(synth: dict) -> None:
                 unsafe_allow_html=True)
 
     if should_trade and direction in ("UP", "DOWN"):
-        bg     = "#041a0a" if direction == "UP" else "#1a0408"
-        txt    = _NEON["UP"]  if direction == "UP" else _NEON["DOWN"]
-        border = "#00c853"    if direction == "UP" else "#d50000"
-        arrow  = "⬆️"        if direction == "UP" else "⬇️"
+        bg     = str("#041a0a" if direction == "UP" else "#1a0408")
+        txt    = str(_NEON["UP"]  if direction == "UP" else _NEON["DOWN"])
+        border = str("#00c853"    if direction == "UP" else "#d50000")
+        arrow  = str("⬆️"        if direction == "UP" else "⬇️")
         st.markdown(
             "<div class='trade-box' style='background:" + bg + ";border:2.5px solid " + border + ";'>"
             "<div class='trade-arrow'>" + arrow + "</div>"
@@ -2401,6 +2475,7 @@ for model in active_models:
         except Exception as exc:
             err_msg = str(exc)
             offline_models.append(model_name)
+            _retire_model(model)
             render_vote_card({"model": model_name, "error_msg": err_msg}, status="offline")
 
 if not analyst_votes:
@@ -2420,8 +2495,8 @@ render_deliberation_round(analyst_votes, revised_votes)
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Cross-examination & final verdict (uses post-deliberation votes)
 # ══════════════════════════════════════════════════════════════════════════════
-n_online = 1 + len(revised_votes)
-n_total  = 1 + len(active_models)
+n_online = len(revised_votes)
+n_total  = len(active_models)
 st.markdown("---")
 st.markdown(
     "<div class='step-header'>Step 3 — Cross-Examination & Final Verdict"
