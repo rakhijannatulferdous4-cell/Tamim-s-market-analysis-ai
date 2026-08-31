@@ -2630,13 +2630,17 @@ st.markdown(
 )
 
 st.markdown("<div class='step-header'>1️⃣ Upload Chart</div>", unsafe_allow_html=True)
+uploaded = st.file_uploader(
+    "Upload chart screenshot",
+    type=["png", "jpg", "jpeg", "webp"],
+    label_visibility="collapsed",
+    help="Screenshot of any trading chart",
+)
+if uploaded:
+    st.image(Image.open(uploaded), caption="Uploaded chart", width="stretch")
+    uploaded.seek(0)
+
 with st.form("debate_inputs_form", clear_on_submit=False):
-    uploaded = st.file_uploader(
-        "Upload chart screenshot",
-        type=["png", "jpg", "jpeg", "webp"],
-        label_visibility="collapsed",
-        help="Screenshot of any trading chart",
-    )
     st.markdown(
         "<div class='step-header'>2️⃣ Extra Context "
         "<span style='font-weight:400;font-size:.8rem;color:#566880;'>(optional)</span>"
@@ -2656,9 +2660,6 @@ with st.form("debate_inputs_form", clear_on_submit=False):
         use_container_width=True,
         type="primary",
     )
-
-if uploaded:
-    st.image(Image.open(uploaded), caption="Uploaded chart", width="stretch")
 
 cached_debate = st.session_state.get("last_debate")
 if not run and not isinstance(cached_debate, dict):
