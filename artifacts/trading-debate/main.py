@@ -86,16 +86,40 @@ def parse_json(text: str) -> dict:
         except Exception:
             pass
     # 4. Last-resort text extraction — some models output structured prose
-    #    instead of JSON. Pull vote / confidence / reasoning from keywords.
-    txt_up = text.upper()
-    vote   = "WAIT"
-    if re.search(r'\bBULLISH\b|\b"UP"\b|\bVOTE[:\s]+UP\b|DIRECTION[:\s]+UP', txt_up):
-        vote = "UP"
-    elif re.search(r'\bBEARISH\b|\b"DOWN"\b|\bVOTE[:\s]+DOWN\b|DIRECTION[:\s]+DOWN', txt_up):
-        vote = "DOWN"
-    conf_m = re.search(r'(\d{1,3})\s*%', text)
+    #    instead of JSON. Honor an explicit vote before scanning explanation
+    #    keywords, because a DOWN answer may still discuss bullish risk.
+    aliases = {
+        "BULLISH": "UP",
+        "BUY": "UP",
+        "UP": "UP",
+        "BEARISH": "DOWN",
+        "SELL": "DOWN",
+        "DOWN": "DOWN",
+        "NEUTRAL": "WAIT",
+        "HOLD": "WAIT",
+        "WAIT": "WAIT",
+    }
+    vote_words = "|".join(aliases)
+    explicit = re.findall(
+        r"\b(?:final\s+)?(?:vote|direction|signal|decision|stance)\b"
+        r"\s*(?:is|should\s+be|[:=-])\s*[\"']?("
+        + vote_words
+        + r")\b",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        vote = aliases[explicit[-1].upper()]
+    else:
+        txt_up = raw.upper()
+        has_up = bool(re.search(r"\bBULLISH\b|\bBUY\b|\bUP\b", txt_up))
+        has_down = bool(re.search(r"\bBEARISH\b|\bSELL\b|\bDOWN\b", txt_up))
+        vote = "UP" if has_up and not has_down else (
+            "DOWN" if has_down and not has_up else "WAIT"
+        )
+    conf_m = re.search(r'(\d{1,3})\s*%', raw)
     conf   = min(int(conf_m.group(1)), 100) if conf_m else 50
-    lines  = [l.strip() for l in text.split("\n") if len(l.strip()) > 25]
+    lines  = [l.strip() for l in raw.split("\n") if len(l.strip()) > 25]
     rsn    = lines[0][:140] if lines else "Model output could not be parsed as JSON."
     return {"vote": vote, "confidence": conf, "reasoning": rsn,
             "_text_extraction": True}
