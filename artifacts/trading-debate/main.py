@@ -270,6 +270,16 @@ def _provider_configured(provider: str) -> bool:
         "Together AI": "TOGETHER_API_KEY",
         "Google Gemini": "GEMINI_API_KEY",
         "Hugging Face": "HF_TOKEN",
+        "GitHub Models": "GITHUB_TOKEN",
+        "Cerebras Cloud": "CEREBRAS_API_KEY",
+        "Cloudflare Workers AI": "CLOUDFLARE_API_KEY",
+        "Mistral AI": "MISTRAL_API_KEY",
+        "Fireworks AI": "FIREWORKS_API_KEY",
+        "DeepInfra": "DEEPINFRA_API_KEY",
+        "SambaNova Cloud": "SAMBANOVA_API_KEY",
+        "Novita AI": "NOVITA_API_KEY",
+        "Hyperbolic": "HYPERBOLIC_API_KEY",
+        "GlHF (glhf.chat)": "GLHF_API_KEY",
     }
     key_name = key_by_provider.get(provider, "")
     return bool(get_secret(key_name) or (
@@ -279,6 +289,7 @@ def _provider_configured(provider: str) -> bool:
 
 _PROVIDER_CONFIG = {
     "OpenRouter": {
+        "label": "OpenRouter · recommended",
         "key": "OPENROUTER_API_KEY",
         "models_url": "https://openrouter.ai/api/v1/models",
         "chat_url": "https://openrouter.ai/api/v1/chat/completions",
@@ -307,6 +318,77 @@ _PROVIDER_CONFIG = {
         "chat_url": "https://router.huggingface.co/v1/chat/completions",
         "kind": "openai",
     },
+    "GitHub Models": {
+        "label": "GitHub Models",
+        "key": "GITHUB_TOKEN",
+        "models_url": "https://models.github.ai/catalog/models",
+        "chat_url": "https://models.github.ai/inference/chat/completions",
+        "kind": "openai",
+    },
+    "Cerebras Cloud": {
+        "label": "Cerebras Cloud",
+        "key": "CEREBRAS_API_KEY",
+        "models_url": "https://api.cerebras.ai/v1/models",
+        "chat_url": "https://api.cerebras.ai/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Cloudflare Workers AI": {
+        "label": "Cloudflare Workers AI · requires Account ID",
+        "key": "CLOUDFLARE_API_KEY",
+        "account_key": "CLOUDFLARE_ACCOUNT_ID",
+        "models_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search",
+        "chat_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Mistral AI": {
+        "label": "Mistral AI",
+        "key": "MISTRAL_API_KEY",
+        "models_url": "https://api.mistral.ai/v1/models",
+        "chat_url": "https://api.mistral.ai/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Fireworks AI": {
+        "label": "Fireworks AI",
+        "key": "FIREWORKS_API_KEY",
+        "models_url": "https://api.fireworks.ai/inference/v1/models",
+        "chat_url": "https://api.fireworks.ai/inference/v1/chat/completions",
+        "kind": "openai",
+    },
+    "DeepInfra": {
+        "label": "DeepInfra",
+        "key": "DEEPINFRA_API_KEY",
+        "models_url": "https://api.deepinfra.com/v1/openai/models",
+        "chat_url": "https://api.deepinfra.com/v1/openai/chat/completions",
+        "kind": "openai",
+    },
+    "SambaNova Cloud": {
+        "label": "SambaNova Cloud",
+        "key": "SAMBANOVA_API_KEY",
+        "models_url": "https://api.sambanova.ai/v1/models",
+        "chat_url": "https://api.sambanova.ai/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Novita AI": {
+        "label": "Novita AI",
+        "key": "NOVITA_API_KEY",
+        "models_url": "https://api.novita.ai/openai/v1/models",
+        "chat_url": "https://api.novita.ai/openai/v1/chat/completions",
+        "kind": "openai",
+    },
+    "Hyperbolic": {
+        "label": "Hyperbolic",
+        "key": "HYPERBOLIC_API_KEY",
+        "models_url": "https://api.hyperbolic.xyz/v1/models",
+        "chat_url": "https://api.hyperbolic.xyz/v1/chat/completions",
+        "kind": "openai",
+    },
+    "GlHF (glhf.chat)": {
+        "label": "GlHF (glhf.chat)",
+        "key": "GLHF_API_KEY",
+        "models_url": "https://glhf.chat/api/openai/v1/models",
+        "chat_url": "https://glhf.chat/api/openai/v1/chat/completions",
+        "kind": "openai",
+    },
 }
 
 
@@ -317,6 +399,31 @@ def _provider_key(provider: str) -> str:
     if provider == "Hugging Face" and not key:
         key = get_secret("HUGGINGFACE_API_KEY")
     return key
+
+
+def _provider_account_id(provider: str) -> str:
+    account_key = _PROVIDER_CONFIG[provider].get("account_key", "")
+    return get_secret(account_key) if account_key else ""
+
+
+def _provider_label(provider: str) -> str:
+    """Return the display name without exposing provider credentials."""
+    config = _PROVIDER_CONFIG.get(provider, {})
+    return str(config.get("label") or provider)
+
+
+def _provider_chat_url(provider: str) -> str:
+    """Resolve provider-specific URL placeholders before making an inference call."""
+    url = _PROVIDER_CONFIG[provider]["chat_url"]
+    account_id = _provider_account_id(provider)
+    if "{account_id}" in url:
+        if not account_id:
+            raise RuntimeError(
+                "Cloudflare Workers AI also requires CLOUDFLARE_ACCOUNT_ID "
+                "in Replit Secrets."
+            )
+        url = url.replace("{account_id}", account_id)
+    return url
 
 
 def _model_supports_images(provider: str, item: dict) -> bool:
@@ -366,7 +473,7 @@ def _model_supports_images(provider: str, item: dict) -> bool:
 
 
 def _normalise_provider_model(provider: str, item: dict) -> dict | None:
-    model_id = str(item.get("id") or item.get("name") or "").strip()
+    model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
     if not model_id:
         return None
     if model_id.startswith("models/"):
@@ -409,6 +516,15 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
     config = _PROVIDER_CONFIG[provider]
     headers = {"Authorization": "Bearer " + api_key}
     params = {}
+    models_url = config["models_url"]
+    account_id = _provider_account_id(provider)
+    if "{account_id}" in models_url:
+        if not account_id:
+            raise RuntimeError(
+                "Cloudflare Workers AI also requires CLOUDFLARE_ACCOUNT_ID "
+                "in Replit Secrets."
+            )
+        models_url = models_url.replace("{account_id}", account_id)
     if provider == "Google Gemini":
         # Keep the credential out of request URLs and therefore out of
         # exception messages, proxy logs, and the rendered UI.
@@ -416,14 +532,23 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
     if provider == "Hugging Face":
         params = {"limit": 200}
     response = requests.get(
-        config["models_url"],
+        models_url,
         headers=headers,
         params=params,
         timeout=30,
     )
     response.raise_for_status()
     payload = response.json()
-    raw_models = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(payload, dict):
+        raw_models = (
+            payload.get("data")
+            or payload.get("models")
+            or payload.get("items")
+            or payload.get("result")
+            or payload
+        )
+    else:
+        raw_models = payload
     if provider == "Google Gemini":
         raw_models = payload.get("models", [])
         for item in raw_models:
@@ -471,7 +596,7 @@ def _openai_vision_request(
     config = _PROVIDER_CONFIG[model["provider"]]
     data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
     response = requests.post(
-        config["chat_url"],
+        _provider_chat_url(model["provider"]),
         headers={
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
@@ -565,7 +690,6 @@ def _call_activated_model(
 
 
 def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
-    config = _PROVIDER_CONFIG[model["provider"]]
     payload = {
         "model": model["id"],
         "messages": [
@@ -578,7 +702,7 @@ def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
     response = None
     for attempt in range(4):
         response = requests.post(
-            config["chat_url"],
+            _provider_chat_url(model["provider"]),
             headers={
                 "Authorization": "Bearer " + api_key,
                 "Content-Type": "application/json",
@@ -2309,13 +2433,7 @@ with st.sidebar:
     provider = st.selectbox(
         "AI provider / aggregator",
         list(_PROVIDER_CONFIG),
-        format_func=lambda value: {
-            "OpenRouter": "OpenRouter · recommended",
-            "Groq": "Groq",
-            "Together AI": "Together AI",
-            "Google Gemini": "Google Gemini",
-            "Hugging Face": "Hugging Face",
-        }[value],
+        format_func=_provider_label,
         key="manager_provider",
     )
     with st.form("provider_connection_form", clear_on_submit=True):
