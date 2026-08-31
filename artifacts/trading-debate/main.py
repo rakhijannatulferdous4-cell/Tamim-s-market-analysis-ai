@@ -1529,15 +1529,13 @@ def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
         platform   = v.get("_platform", "Groq")
         prompt     = _build_deliberation_prompt(model_name, analyst_votes)
         try:
-            if platform == "Groq" and model_id:
-                r = _call_groq_raw(model_id, model_name, prompt)
-            elif platform == "Gemini":
-                r = _call_gemini_raw(model_name, prompt)
-            elif platform == "DeepSeek":
-                r = _call_deepseek_raw(model_name, prompt)
-            else:
+            active_model = v.get("_active_model")
+            if not isinstance(active_model, dict):
                 revised.append({**v, "_deliberated": False, "_round1_vote": v.get("vote", "?")})
                 continue
+            # Deliberation is text-only, so every active model can participate:
+            # vision models use their text endpoint without a second image call.
+            r = _call_activated_text_model(active_model, prompt)
             r["_platform"]    = platform
             r["_model_id"]    = model_id
             r["_deliberated"] = True
