@@ -14,6 +14,7 @@ Step 3  Final Verdict : Top Groq text model synthesis
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 import json
 import os
@@ -436,10 +437,14 @@ def _provider_label(provider: str) -> str:
     return str(config.get("label") or provider)
 
 
-def _provider_chat_url(provider: str) -> str:
+def _provider_chat_url(provider: str, account_id_override: str | None = None) -> str:
     """Resolve provider-specific URL placeholders before making an inference call."""
     url = _PROVIDER_CONFIG[provider]["chat_url"]
-    account_id = _provider_account_id(provider)
+    account_id = (
+        account_id_override
+        if account_id_override is not None
+        else _provider_account_id(provider)
+    )
     if "{account_id}" in url:
         if not account_id:
             raise RuntimeError(
@@ -615,12 +620,17 @@ def _model_label(model: dict) -> str:
 
 
 def _openai_vision_request(
-    model: dict, api_key: str, image_bytes: bytes, mime: str, prompt: str
+    model: dict,
+    api_key: str,
+    image_bytes: bytes,
+    mime: str,
+    prompt: str,
+    account_id_override: str | None = None,
 ) -> str:
     config = _PROVIDER_CONFIG[model["provider"]]
     data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
     response = requests.post(
-        _provider_chat_url(model["provider"]),
+        _provider_chat_url(model["provider"], account_id_override),
         headers={
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
@@ -643,7 +653,7 @@ def _openai_vision_request(
             "temperature": 0.3,
             "max_tokens": 1800,
         },
-        timeout=90,
+        timeout=(8, 60),
     )
     response.raise_for_status()
     body = response.json()
@@ -670,8 +680,9 @@ def _gemini_vision_request(
         }],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 1800,
+            "maxOutputTokens": 1200,
             "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
     response = requests.post(
@@ -679,7 +690,7 @@ def _gemini_vision_request(
         + model["id"] + ":generateContent",
         headers={"x-goog-api-key": api_key},
         json=data,
-        timeout=90,
+        timeout=(8, 35),
     )
     response.raise_for_status()
     body = response.json()
@@ -690,16 +701,27 @@ def _gemini_vision_request(
 
 
 def _call_activated_model(
-    model: dict, image_bytes: bytes, mime: str, prompt: str
+    model: dict,
+    image_bytes: bytes,
+    mime: str,
+    prompt: str,
+    api_key_override: str | None = None,
+    account_id_override: str | None = None,
 ) -> dict:
     """Send the image to vision models; text models are handled separately."""
-    api_key = _provider_key(model["provider"])
+    api_key = (
+        api_key_override
+        if api_key_override is not None
+        else _provider_key(model["provider"])
+    )
     if not api_key:
         raise RuntimeError(model["provider"] + " API key is not configured.")
     if model["kind"] == "gemini":
         raw = _gemini_vision_request(model, api_key, image_bytes, mime, prompt)
     else:
-        raw = _openai_vision_request(model, api_key, image_bytes, mime, prompt)
+        raw = _openai_vision_request(
+            model, api_key, image_bytes, mime, prompt, account_id_override
+        )
     result = parse_json(raw)
     result.setdefault("model", model["name"])
     result["_platform"] = model["provider"]
@@ -713,7 +735,12 @@ def _call_activated_model(
     )
 
 
-def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
+def _openai_text_request(
+    model: dict,
+    api_key: str,
+    prompt: str,
+    account_id_override: str | None = None,
+) -> str:
     payload = {
         "model": model["id"],
         "messages": [
@@ -726,13 +753,13 @@ def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
     response = None
     for attempt in range(4):
         response = requests.post(
-            _provider_chat_url(model["provider"]),
+            _provider_chat_url(model["provider"], account_id_override),
             headers={
                 "Authorization": "Bearer " + api_key,
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=90,
+            timeout=(8, 60),
         )
         if response.status_code != 429 or attempt == 3:
             break
@@ -750,8 +777,17 @@ def _openai_text_request(model: dict, api_key: str, prompt: str) -> str:
         raise RuntimeError("The provider returned no model response.") from exc
 
 
-def _call_activated_text_model(model: dict, prompt: str) -> dict:
-    api_key = _provider_key(model["provider"])
+def _call_activated_text_model(
+    model: dict,
+    prompt: str,
+    api_key_override: str | None = None,
+    account_id_override: str | None = None,
+) -> dict:
+    api_key = (
+        api_key_override
+        if api_key_override is not None
+        else _provider_key(model["provider"])
+    )
     if not api_key:
         raise RuntimeError(model["provider"] + " API key is not configured.")
     if model["kind"] == "gemini":
@@ -764,11 +800,12 @@ def _call_activated_text_model(model: dict, prompt: str) -> dict:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.3,
-                    "maxOutputTokens": 1200,
+                    "maxOutputTokens": 900,
                     "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingLevel": "MINIMAL"},
                 },
             },
-            timeout=90,
+            timeout=(8, 35),
         )
         response.raise_for_status()
         body = response.json()
@@ -777,7 +814,9 @@ def _call_activated_text_model(model: dict, prompt: str) -> dict:
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("Gemini returned no model response.") from exc
     else:
-        raw = _openai_text_request(model, api_key, prompt)
+        raw = _openai_text_request(
+            model, api_key, prompt, account_id_override
+        )
     result = parse_json(raw)
     result.setdefault("model", model["name"])
     result["_platform"] = model["provider"]
@@ -1522,29 +1561,56 @@ def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
     final vote.  Falls back to Round 1 result on any API failure.
     Returns a list in the same format as analyst_votes.
     """
-    revised: list[dict] = []
-    for v in analyst_votes:
-        model_name = v.get("model", "?")
-        model_id   = v.get("_model_id", "")
-        platform   = v.get("_platform", "Groq")
-        prompt     = _build_deliberation_prompt(model_name, analyst_votes)
-        try:
-            active_model = v.get("_active_model")
-            if not isinstance(active_model, dict):
-                revised.append({**v, "_deliberated": False, "_round1_vote": v.get("vote", "?")})
-                continue
-            # Deliberation is text-only, so every active model can participate:
-            # vision models use their text endpoint without a second image call.
-            r = _call_activated_text_model(active_model, prompt)
-            r["_platform"]    = platform
-            r["_model_id"]    = model_id
-            r["_deliberated"] = True
-            r["_round1_vote"] = v.get("vote", "?")
-            r.setdefault("key_risks", v.get("key_risks", []))
-            r.setdefault("analysis",  v.get("analysis", ""))
-            revised.append(r)
-        except Exception:
-            revised.append({**v, "_deliberated": False, "_round1_vote": v.get("vote", "?")})
+    credentials: dict[str, tuple[str, str]] = {}
+    for vote in analyst_votes:
+        active_model = vote.get("_active_model")
+        if isinstance(active_model, dict):
+            provider = active_model.get("provider", vote.get("_platform", ""))
+            if provider not in credentials:
+                credentials[provider] = (
+                    _provider_key(provider),
+                    _provider_account_id(provider),
+                )
+
+    def deliberate(vote: dict) -> dict:
+        model_name = vote.get("model", "?")
+        model_id = vote.get("_model_id", "")
+        platform = vote.get("_platform", "Groq")
+        active_model = vote.get("_active_model")
+        if not isinstance(active_model, dict):
+            return {
+                **vote,
+                "_deliberated": False,
+                "_round1_vote": vote.get("vote", "?"),
+            }
+        api_key, account_id = credentials.get(
+            active_model.get("provider", platform), ("", "")
+        )
+        prompt = _build_deliberation_prompt(model_name, analyst_votes)
+        r = _call_activated_text_model(
+            active_model, prompt, api_key, account_id
+        )
+        r["_platform"] = platform
+        r["_model_id"] = model_id
+        r["_deliberated"] = True
+        r["_round1_vote"] = vote.get("vote", "?")
+        r.setdefault("key_risks", vote.get("key_risks", []))
+        r.setdefault("analysis", vote.get("analysis", ""))
+        return r
+
+    # Do not make a slow provider hold every other analyst hostage.
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(analyst_votes)))) as pool:
+        futures = {pool.submit(deliberate, vote): vote for vote in analyst_votes}
+        revised: list[dict] = []
+        for future, vote in futures.items():
+            try:
+                revised.append(future.result())
+            except Exception:
+                revised.append({
+                    **vote,
+                    "_deliberated": False,
+                    "_round1_vote": vote.get("vote", "?"),
+                })
     return revised
 
 
@@ -2564,46 +2630,51 @@ st.markdown(
 )
 
 st.markdown("<div class='step-header'>1️⃣ Upload Chart</div>", unsafe_allow_html=True)
-uploaded = st.file_uploader(
-    "Upload chart screenshot",
-    type=["png", "jpg", "jpeg", "webp"],
-    label_visibility="collapsed",
-    help="Screenshot of any trading chart",
-)
+with st.form("debate_inputs_form", clear_on_submit=False):
+    uploaded = st.file_uploader(
+        "Upload chart screenshot",
+        type=["png", "jpg", "jpeg", "webp"],
+        label_visibility="collapsed",
+        help="Screenshot of any trading chart",
+    )
+    st.markdown(
+        "<div class='step-header'>2️⃣ Extra Context "
+        "<span style='font-weight:400;font-size:.8rem;color:#566880;'>(optional)</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    extra_ctx = st.text_area(
+        "context",
+        label_visibility="collapsed",
+        placeholder="e.g. BTC/USDT 10-min chart, NY session open…",
+        height=70,
+    )
+    st.markdown("<div class='step-header'>3️⃣ Start the Debate</div>", unsafe_allow_html=True)
+    run = st.form_submit_button(
+        "🚀  START AI DEBATE",
+        disabled=(uploaded is None),
+        use_container_width=True,
+        type="primary",
+    )
+
 if uploaded:
     st.image(Image.open(uploaded), caption="Uploaded chart", width="stretch")
 
-st.markdown(
-    "<div class='step-header'>2️⃣ Extra Context "
-    "<span style='font-weight:400;font-size:.8rem;color:#566880;'>(optional)</span>"
-    "</div>",
-    unsafe_allow_html=True,
-)
-extra_ctx = st.text_area(
-    "context",
-    label_visibility="collapsed",
-    placeholder="e.g. BTC/USDT 10-min chart, NY session open…",
-    height=70,
-)
-
-st.markdown("<div class='step-header'>3️⃣ Start the Debate</div>", unsafe_allow_html=True)
-run = st.button(
-    "🚀  START AI DEBATE",
-    disabled=(uploaded is None),
-    use_container_width=True,
-    type="primary",
-)
-
-if not run:
+cached_debate = st.session_state.get("last_debate")
+if not run and not isinstance(cached_debate, dict):
     st.stop()
 
 # ── Read image bytes ──────────────────────────────────────────────────────────
-uploaded.seek(0)
-image_bytes = uploaded.read()
-ext      = uploaded.name.rsplit(".", 1)[-1].lower()
-mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "png": "image/png",  "webp": "image/webp"}
-mime_type = mime_map.get(ext, "image/jpeg")
+if run:
+    uploaded.seek(0)
+    image_bytes = uploaded.read()
+    ext = uploaded.name.rsplit(".", 1)[-1].lower()
+    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "png": "image/png", "webp": "image/webp"}
+    mime_type = mime_map.get(ext, "image/jpeg")
+else:
+    image_bytes = b""
+    mime_type = cached_debate.get("mime_type", "image/png")
 
 st.markdown("---")
 
@@ -2612,15 +2683,19 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("<div class='step-header'>Step 1 — Chart Analysis & Market News</div>",
             unsafe_allow_html=True)
-with st.spinner("🔍 Reading chart… Groq vision model…"):
-    chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
+if run:
+    with st.spinner("🔍 Reading chart… Groq vision model…"):
+        chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
 
-asset_name = chart_data.get("asset", "asset")
-# Store trader's extra context in chart_data so ALL prompts can see it
-chart_data["user_context"] = extra_ctx.strip() if extra_ctx else ""
+    asset_name = chart_data.get("asset", "asset")
+    # Store trader's extra context in chart_data so ALL prompts can see it
+    chart_data["user_context"] = extra_ctx.strip() if extra_ctx else ""
 
-with st.spinner("🌐 Searching latest market news for " + asset_name + "…"):
-    chart_data = _inject_real_news(chart_data)
+    with st.spinner("🌐 Searching latest market news for " + asset_name + "…"):
+        chart_data = _inject_real_news(chart_data)
+else:
+    chart_data = cached_debate["chart_data"]
+    vision_status = cached_debate["vision_status"]
 
 render_chart_analysis(chart_data, vision_status)
 
@@ -2649,41 +2724,65 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-analyst_votes: list[dict] = []
+if run:
+    analyst_votes: list[dict] = []
+    runtime_credentials = {
+        provider: (_provider_key(provider), _provider_account_id(provider))
+        for provider in {model["provider"] for model in active_models}
+    }
 
-for model in active_models:
-    model_name = _model_label(model)
-    with st.spinner(_model_icon(model_name) + " " + model_name + " is analysing…"):
-        try:
-            if model.get("vision") and model.get("id") == chart_data.get("_vision_model_id"):
-                # The primary vision pass is already this model's answer. Reuse it
-                # instead of spending a second request and triggering provider rate limits.
-                result = {
-                    **chart_data,
-                    "model": model["name"],
-                    "_platform": model["provider"],
-                    "_provider": model["provider"],
-                    "_model_id": model["id"],
-                    "_active_model": model,
-                }
-                result = _normalise_vote_fields(
-                    result, "The uploaded chart was read by " + model["name"] + "."
-                )
-            elif model.get("vision"):
-                result = _call_activated_model(
-                    model, image_bytes, mime_type, _activated_chart_prompt(extra_ctx)
-                )
-            else:
-                result = _call_activated_text_model(
-                    model, _activated_vote_prompt(chart_data, extra_ctx)
-                )
-            analyst_votes.append(result)
-            render_vote_card(result, status="online")
-        except Exception as exc:
-            _retire_model(model)
-            # Failed models are silently retired. Keep the visible committee
-            # limited to models that returned a successful response.
-            continue
+    def _run_first_round_model(model: dict) -> dict:
+        """Run one independent analyst without touching Streamlit from a worker."""
+        provider_key, account_id = runtime_credentials.get(model["provider"], ("", ""))
+        if model.get("vision") and model.get("id") == chart_data.get("_vision_model_id"):
+            # The primary vision pass is already this model's answer. Reuse it
+            # instead of spending a second request and triggering provider rate limits.
+            result = {
+                **chart_data,
+                "model": model["name"],
+                "_platform": model["provider"],
+                "_provider": model["provider"],
+                "_model_id": model["id"],
+                "_active_model": model,
+            }
+            return _normalise_vote_fields(
+                result, "The uploaded chart was read by " + model["name"] + "."
+            )
+        if model.get("vision"):
+            return _call_activated_model(
+                model,
+                image_bytes,
+                mime_type,
+                _activated_chart_prompt(extra_ctx),
+                provider_key,
+                account_id,
+            )
+        return _call_activated_text_model(
+            model,
+            _activated_vote_prompt(chart_data, extra_ctx),
+            provider_key,
+            account_id,
+        )
+
+    # Parallel requests keep a slow Gemini model from delaying fast Groq models.
+    with st.spinner("⚡ Running independent model votes in parallel…"):
+        with ThreadPoolExecutor(max_workers=min(6, max(1, len(active_models)))) as pool:
+            futures = {
+                pool.submit(_run_first_round_model, model): model
+                for model in active_models
+            }
+            for future in as_completed(futures):
+                model = futures[future]
+                try:
+                    outcome = future.result()
+                    analyst_votes.append(outcome)
+                    # Fast providers appear immediately; slower Gemini calls
+                    # continue in the background without blocking their cards.
+                    render_vote_card(outcome, status="online")
+                except Exception as exc:
+                    _retire_model(model)
+else:
+    analyst_votes = cached_debate["analyst_votes"]
 
 if not analyst_votes:
     st.info("No currently available model returned a result. Reconnect a provider and try again.")
@@ -2694,8 +2793,11 @@ render_scoreboard(chart_data, analyst_votes, [])
 # ══════════════════════════════════════════════════════════════════════════════
 # DELIBERATION — AIs share full reasoning and submit revised final votes
 # ══════════════════════════════════════════════════════════════════════════════
-with st.spinner("🔄 Running deliberation round — AIs reading each other's reasoning…"):
-    revised_votes = run_deliberation_round(analyst_votes)
+if run:
+    with st.spinner("🔄 Running deliberation round — AIs reading each other's reasoning…"):
+        revised_votes = run_deliberation_round(analyst_votes)
+else:
+    revised_votes = cached_debate["revised_votes"]
 
 render_deliberation_round(analyst_votes, revised_votes)
 
@@ -2712,13 +2814,25 @@ st.markdown(
     + str(n_online) + "/" + str(n_total) + " models online</span></div>",
     unsafe_allow_html=True,
 )
-with st.spinner("🧠 Cross-examining all deliberated positions and computing final verdict…"):
-    try:
-        synthesis = step3_synthesize(chart_data, revised_votes)
-    except Exception as exc:
-        st.error("**Final synthesis failed:** " + _safe_error(exc))
-        st.stop()
+if run:
+    with st.spinner("🧠 Cross-examining all deliberated positions and computing final verdict…"):
+        try:
+            synthesis = step3_synthesize(chart_data, revised_votes)
+        except Exception as exc:
+            st.error("**Final synthesis failed:** " + _safe_error(exc))
+            st.stop()
+    st.session_state["last_debate"] = {
+        "chart_data": chart_data,
+        "vision_status": vision_status,
+        "analyst_votes": analyst_votes,
+        "revised_votes": revised_votes,
+        "synthesis": synthesis,
+        "mime_type": mime_type,
+    }
+else:
+    synthesis = cached_debate["synthesis"]
 
 render_final_decision(synthesis)
 render_trade_recommendation(synthesis)
-st.balloons()
+if run:
+    st.balloons()

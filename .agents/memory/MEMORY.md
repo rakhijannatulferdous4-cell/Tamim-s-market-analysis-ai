@@ -1,3 +1,4 @@
 - [Gemini Python SDK](gemini-python-sdk.md) — Use the maintained `google-genai` SDK for Gemini calls; avoid the deprecated `google.generativeai` package.
 - [Model roster runtime](model-roster-runtime.md) — Filter provider catalogs to chat-capable entries and avoid duplicate vision calls that trigger rate limits.
 - [Published artifact routing](deployment-artifact-routing.md) — Publishing uses registered artifact production services; legacy standalone Streamlit TOML may be ignored.
+- [Streamlit long-run resilience](streamlit-long-run-resilience.md) — Cache completed debates and keep the proxied websocket alive when provider calls can run for minutes.
