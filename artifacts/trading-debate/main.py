@@ -859,17 +859,34 @@ def step1_analyze_active_models(
 
 
 def _activated_vote_prompt(chart_data: dict, extra: str = "") -> str:
-    """Give text-only models the structured output of the vision pass honestly."""
+    """Give text-only models chart facts without seeding another model's vote."""
+    fact_fields = {
+        "asset",
+        "timeframe",
+        "timeframe_minutes",
+        "current_price",
+        "trend",
+        "support",
+        "resistance",
+        "indicators",
+        "patterns",
+        "live_news",
+        "news_summary",
+        "news_context",
+        "news_searched",
+    }
     safe_data = {
-        key: value for key, value in chart_data.items()
-        if key not in {"vision_results", "_active_model"}
+        key: value for key, value in chart_data.items() if key in fact_fields
     }
     return (
-        "You are an independent trading analyst. A vision model already inspected "
-        "the uploaded chart and produced the structured chart record below. Use only "
-        "that record; do not claim that you personally saw pixels. Return valid JSON "
-        "with vote UP, DOWN, or WAIT, confidence 0-100, analysis, key_risks, and "
-        "reasoning. Be specific and acknowledge uncertainty.\n\n"
+        "You are an independent trading analyst. A vision pass transcribed factual "
+        "observations from the uploaded chart into the record below. The record "
+        "intentionally excludes the vision model's vote, confidence, reasoning, "
+        "analysis, and recommendation. Do not claim that you personally saw pixels. "
+        "Derive your own signal from the chart facts and news: UP, DOWN, or WAIT. "
+        "DOWN is a valid outcome when bearish evidence is stronger. Return valid JSON "
+        "with vote, confidence 0-100, analysis, key_risks, and reasoning. Be specific "
+        "and acknowledge uncertainty.\n\n"
         "CHART RECORD:\n" + json.dumps(safe_data, ensure_ascii=False, default=str)
         + ("\nTRADER CONTEXT:\n" + extra.strip() if extra.strip() else "")
     )
