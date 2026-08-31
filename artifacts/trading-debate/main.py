@@ -101,6 +101,24 @@ def parse_json(text: str) -> dict:
             "_text_extraction": True}
 
 
+def _safe_error(error: object) -> str:
+    """Make provider errors useful without ever rendering credentials."""
+    message = str(error or "The provider did not return a response.")
+    message = re.sub(
+        r"([?&](?:key|api_key|apikey|token|access_token)=)[^&\s]+",
+        r"\1[redacted]",
+        message,
+        flags=re.IGNORECASE,
+    )
+    message = re.sub(
+        r"(Bearer\s+|AIza)[A-Za-z0-9._\-/+=-]+",
+        r"\1[redacted]",
+        message,
+        flags=re.IGNORECASE,
+    )
+    return message[:240]
+
+
 def _normalise_vote_fields(result: dict, default_reason: str) -> dict:
     """Keep model-specific vote formats consistent in the UI and prompts."""
     raw_vote = str(
@@ -326,9 +344,23 @@ def _model_supports_images(provider: str, item: dict) -> bool:
         "qwen2.5-vl", "gemma-3", "pixtral", "internvl", "minicpm-v",
     ))
     if provider == "Google Gemini":
+        methods = {
+            str(v).lower() for v in item.get("supported_generation_methods", [])
+        }
         return (
-            "generatecontent" in {str(v).lower() for v in item.get("supported_generation_methods", [])}
-            and not any(token in model_id for token in ("embedding", "aqa", "tts"))
+            "generatecontent" in methods
+            and (
+                explicit
+                or described
+                or model_id.startswith("gemini-")
+            )
+            and not any(
+                token in model_id
+                for token in (
+                    "embedding", "aqa", "tts", "imagen", "veo",
+                    "antigravity", "deep-research", "research",
+                )
+            )
         )
     return explicit or described or hf_vision or known_vision_id
 
@@ -378,8 +410,9 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
     headers = {"Authorization": "Bearer " + api_key}
     params = {}
     if provider == "Google Gemini":
-        headers = {}
-        params = {"key": api_key}
+        # Keep the credential out of request URLs and therefore out of
+        # exception messages, proxy logs, and the rendered UI.
+        headers = {"x-goog-api-key": api_key}
     if provider == "Hugging Face":
         params = {"limit": 200}
     response = requests.get(
@@ -495,7 +528,7 @@ def _gemini_vision_request(
     response = requests.post(
         "https://generativelanguage.googleapis.com/v1beta/models/"
         + model["id"] + ":generateContent",
-        params={"key": api_key},
+        headers={"x-goog-api-key": api_key},
         json=data,
         timeout=90,
     )
@@ -578,7 +611,7 @@ def _call_activated_text_model(model: dict, prompt: str) -> dict:
         response = requests.post(
             "https://generativelanguage.googleapis.com/v1beta/models/"
             + model["id"] + ":generateContent",
-            params={"key": api_key},
+            headers={"x-goog-api-key": api_key},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
@@ -651,7 +684,7 @@ def step1_analyze_active_models(
         try:
             results.append(_call_activated_model(model, image_bytes, mime, prompt))
         except Exception as exc:
-            failures.append((_model_label(model), str(exc)[:240]))
+            failures.append((_model_label(model), _safe_error(exc)))
 
     if not results:
         fallback = dict(_TEXT_FALLBACK_DATA)
@@ -927,7 +960,7 @@ def step1_analyze_chart(image_bytes: bytes, mime: str, extra: str) -> tuple[dict
             groq_model_used = model_id
             break
         except Exception as exc:
-            groq_error += f"{model_id}: {str(exc)[:60]}; "
+            groq_error += f"{model_id}: {_safe_error(exc)[:60]}; "
 
     if groq_data:
         chart_data = groq_data
@@ -1597,6 +1630,15 @@ _PREMIUM_CSS = """
     0%   { top: -2px; }
     100% { top: 100%; }
 }
+@keyframes ambientDrift {
+    0%,100% { transform: translate3d(0,0,0) scale(1); opacity:.18; }
+    50%     { transform: translate3d(2vw,-1.5vh,0) scale(1.04); opacity:.28; }
+}
+@keyframes headerReveal {
+    0%   { opacity:.35; letter-spacing:.02em; }
+    50%  { opacity:1; letter-spacing:.035em; }
+    100% { opacity:.92; letter-spacing:.02em; }
+}
 
 /* ── Base dark theme ────────────────────────────────────────────────── */
 html, body, [data-testid="stAppViewContainer"] {
@@ -1604,6 +1646,18 @@ html, body, [data-testid="stAppViewContainer"] {
     color: #c8d6e8;
     font-family: 'Inter', 'Segoe UI', sans-serif;
 }
+[data-testid="stAppViewContainer"]::before {
+    content:'';
+    position:fixed; inset:-12%;
+    pointer-events:none; z-index:0;
+    background:
+        radial-gradient(circle at 18% 16%, #00b4ff18 0 8%, transparent 28%),
+        radial-gradient(circle at 84% 72%, #00ff8812 0 7%, transparent 26%),
+        linear-gradient(115deg, transparent 0 48%, #1a356012 49%, transparent 50%);
+    background-size: 100% 100%, 100% 100%, 34px 34px;
+    animation: ambientDrift 14s ease-in-out infinite;
+}
+[data-testid="stMain"] { position:relative; z-index:1; }
 [data-testid="stHeader"],
 [data-testid="stToolbar"]    { background: transparent !important; }
 [data-testid="stSidebar"]    {
@@ -1957,7 +2011,7 @@ def render_vote_card(v: dict, status: str = "online") -> None:
     badge    = _platform_badge(platform) if platform else ""
 
     if status == "offline":
-        err = str(v.get("error_msg", "This model did not respond."))[:240]
+        err = _safe_error(v.get("error_msg", "This model did not respond."))
         plat = v.get("_platform", "")
         b    = _platform_badge(plat) if plat else ""
         st.markdown(
@@ -2242,7 +2296,7 @@ if not st.session_state["active_models"] and get_secret("GROQ_API_KEY"):
         st.session_state["available_models"] = discovered
         st.session_state["active_models"] = discovered
     except Exception as exc:
-        st.session_state["provider_errors"]["Groq"] = str(exc)[:240]
+        st.session_state["provider_errors"]["Groq"] = _safe_error(exc)
 
 with st.sidebar:
     st.markdown(
@@ -2301,7 +2355,7 @@ with st.sidebar:
                     )
                     st.rerun()
                 except Exception as exc:
-                    message = str(exc)
+                    message = _safe_error(exc)
                     st.session_state["provider_errors"][provider] = message[:240]
                     st.error("Could not connect: " + message[:240])
 
@@ -2473,8 +2527,8 @@ for model in active_models:
             analyst_votes.append(result)
             render_vote_card(result, status="online")
         except Exception as exc:
-            err_msg = str(exc)
             offline_models.append(model_name)
+            err_msg = _safe_error(exc)
             _retire_model(model)
             render_vote_card({"model": model_name, "error_msg": err_msg}, status="offline")
 
@@ -2516,7 +2570,7 @@ with st.spinner("🧠 Cross-examining all deliberated positions and computing fi
     try:
         synthesis = step3_synthesize(chart_data, revised_votes)
     except Exception as exc:
-        st.error("**Final synthesis failed:** " + str(exc))
+        st.error("**Final synthesis failed:** " + _safe_error(exc))
         st.stop()
 
 render_final_decision(synthesis)
