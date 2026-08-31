@@ -2061,10 +2061,7 @@ def render_scoreboard(chart_data: dict, analyst_votes: list[dict],
         "conf":     v.get("confidence", 0),
         "icon":     _model_icon(v.get("model", "")),
         "platform": v.get("_platform", ""),
-    } for v in analyst_votes] + [
-        {"model": nm, "vote": "OFFLINE", "conf": 0, "icon": "🔴", "platform": ""}
-        for nm in offline
-    ]
+    } for v in analyst_votes]
 
     cols = st.columns(max(len(entries), 1))
     for col, entry in zip(cols, entries):
@@ -2495,8 +2492,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-analyst_votes:  list[dict] = []
-offline_models: list[str]  = []
+analyst_votes: list[dict] = []
 
 for model in active_models:
     model_name = _model_label(model)
@@ -2527,16 +2523,16 @@ for model in active_models:
             analyst_votes.append(result)
             render_vote_card(result, status="online")
         except Exception as exc:
-            offline_models.append(model_name)
-            err_msg = _safe_error(exc)
             _retire_model(model)
-            render_vote_card({"model": model_name, "error_msg": err_msg}, status="offline")
+            # Failed models are silently retired. Keep the visible committee
+            # limited to models that returned a successful response.
+            continue
 
 if not analyst_votes:
-    st.error("All analyst models are currently offline. Please try again in a few minutes.")
+    st.info("No currently available model returned a result. Reconnect a provider and try again.")
     st.stop()
 
-render_scoreboard(chart_data, analyst_votes, offline_models)
+render_scoreboard(chart_data, analyst_votes, [])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DELIBERATION — AIs share full reasoning and submit revised final votes
@@ -2550,7 +2546,7 @@ render_deliberation_round(analyst_votes, revised_votes)
 # STEP 3 — Cross-examination & final verdict (uses post-deliberation votes)
 # ══════════════════════════════════════════════════════════════════════════════
 n_online = len(revised_votes)
-n_total  = len(active_models)
+n_total  = len(analyst_votes)
 st.markdown("---")
 st.markdown(
     "<div class='step-header'>Step 3 — Cross-Examination & Final Verdict"
@@ -2559,13 +2555,6 @@ st.markdown(
     + str(n_online) + "/" + str(n_total) + " models online</span></div>",
     unsafe_allow_html=True,
 )
-if offline_models:
-    st.markdown(
-        "<p style='font-size:.78rem;color:#566880;'>🔴 Offline this run: "
-        + ", ".join(offline_models) + "</p>",
-        unsafe_allow_html=True,
-    )
-
 with st.spinner("🧠 Cross-examining all deliberated positions and computing final verdict…"):
     try:
         synthesis = step3_synthesize(chart_data, revised_votes)
