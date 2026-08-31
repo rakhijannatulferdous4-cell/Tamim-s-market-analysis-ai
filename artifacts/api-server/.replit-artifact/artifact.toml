@@ -10,7 +10,7 @@ name = "AI Trading Debate"
 paths = ["/"]
 
 [services.development]
-run = "cd artifacts/trading-debate && python -m streamlit run main.py --server.port 8000 --server.address 0.0.0.0 --server.headless true"
+run = "cd ../trading-debate && python -m streamlit run main.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
 
 [services.production]
 
