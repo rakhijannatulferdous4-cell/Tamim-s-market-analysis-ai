@@ -3,7 +3,8 @@ import os
 import json
 import re
 import base64
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from groq import Groq
 
 # Page Config with Dark Premium Theme Styling
@@ -43,16 +44,24 @@ st.markdown("""
 
 st.title("📈 AI Trading Committee — Live Debate")
 
-# API Keys
-GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", "")
-GROQ_KEY = st.secrets.get("GROQ_API_KEY", "")
-DEEPSEEK_KEY = st.secrets.get("DEEPSEEK_API_KEY", "")
+def get_secret(name):
+    """Read a key from Streamlit secrets first, then the OS environment."""
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return str(value or os.environ.get(name, "") or "")
+
+
+# API keys stay server-side and are never placed in the page or URL.
+GEMINI_KEY = get_secret("GEMINI_API_KEY")
+GROQ_KEY = get_secret("GROQ_API_KEY")
+DEEPSEEK_KEY = get_secret("DEEPSEEK_API_KEY")
 
 def clean_json_response(text):
     try:
         cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-        cleaned = re.sub(r'```json\s*|\s*
-```', '', cleaned).strip()
+        cleaned = re.sub(r"```json\s*|```", "", cleaned).strip()
         return json.loads(cleaned)
     except:
         try:
@@ -77,12 +86,16 @@ if uploaded_file and st.button("🚀 START AI DEBATE"):
     if GEMINI_KEY:
         try:
             with st.spinner("Analyzing chart with Gemini..."):
-                genai.configure(api_key=GEMINI_KEY)
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                response = model.generate_content([
-                    {"mime_type": "image/jpeg", "data": image_bytes},
-                    "Analyze this trading chart layout. Identify support, resistance, and current macro trend."
-                ])
+                client = genai.Client(api_key=GEMINI_KEY)
+                response = client.models.generate_content(
+                    model="gemini-3-flash-preview",
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_bytes, mime_type="image/jpeg"
+                        ),
+                        "Analyze this trading chart layout. Identify support, resistance, and current macro trend.",
+                    ],
+                )
                 chart_context = response.text
                 if chart_context:
                     vision_success = True
@@ -140,8 +153,15 @@ if uploaded_file and st.button("🚀 START AI DEBATE"):
             vote_data = None
             try:
                 if provider == "gemini" and vision_success:
-                    m = genai.GenerativeModel('gemini-1.5-flash')
-                    res = m.generate_content(prompt_template)
+                    client = genai.Client(api_key=GEMINI_KEY)
+                    res = client.models.generate_content(
+                        model="gemini-3-flash-preview",
+                        contents=prompt_template,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            max_output_tokens=8192,
+                        ),
+                    )
                     vote_data = clean_json_response(res.text)
                 elif provider.startswith("groq:"):
                     m_id = provider.split(":")[1]
