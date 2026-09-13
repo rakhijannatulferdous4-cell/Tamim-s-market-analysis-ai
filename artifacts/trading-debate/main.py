@@ -24,6 +24,10 @@ import time
 import requests
 import streamlit as st
 from PIL import Image
+from google import genai
+from google.genai import types
+from groq import Groq
+from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config — sidebar expanded so the model manager is immediately visible
@@ -60,10 +64,33 @@ def require_secret(key: str) -> str:
     if not val:
         st.error(
             f"**{key}** is missing.\n\n"
-            "Open the Replit **Secrets** panel (🔒 icon) and add it there."
+            "Add it to Streamlit secrets or the deployment environment."
         )
         st.stop()
     return val
+
+
+def _api_key(key: str) -> str:
+    """Read a provider key without relying on platform-specific services."""
+    value = get_secret(key)
+    if not value:
+        raise RuntimeError(f"{key} is not configured.")
+    return value
+
+
+def _gemini_client(api_key: str | None = None) -> genai.Client:
+    return genai.Client(api_key=api_key or _api_key("GEMINI_API_KEY"))
+
+
+def _groq_client(api_key: str | None = None) -> Groq:
+    return Groq(api_key=api_key or _api_key("GROQ_API_KEY"))
+
+
+def _deepseek_client(api_key: str | None = None) -> OpenAI:
+    return OpenAI(
+        api_key=api_key or _api_key("DEEPSEEK_API_KEY"),
+        base_url="https://api.deepseek.com",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,8 +234,7 @@ def _discover_groq_vision_models() -> list[str]:
     try:
         if not get_secret("GROQ_API_KEY"):
             return []
-        from groq import Groq
-        client = Groq(api_key=require_secret("GROQ_API_KEY"))
+        client = _groq_client()
         listing = client.models.list()
         vision_models = [
             m for m in listing.data
@@ -236,8 +262,7 @@ def _discover_groq_text_models(n: int = 3) -> list[tuple[str, str]]:
     try:
         if not get_secret("GROQ_API_KEY"):
             return []
-        from groq import Groq
-        client = Groq(api_key=require_secret("GROQ_API_KEY"))
+        client = _groq_client()
         listing = client.models.list()
 
         candidates: list[tuple[int, str]] = []
@@ -449,7 +474,7 @@ def _provider_chat_url(provider: str, account_id_override: str | None = None) ->
         if not account_id:
             raise RuntimeError(
                 "Cloudflare Workers AI also requires CLOUDFLARE_ACCOUNT_ID "
-                "in Replit Secrets."
+                "in Streamlit secrets or the deployment environment."
             )
         url = url.replace("{account_id}", account_id)
     return url
@@ -551,7 +576,7 @@ def _discover_provider_models(provider: str, api_key: str) -> list[dict]:
         if not account_id:
             raise RuntimeError(
                 "Cloudflare Workers AI also requires CLOUDFLARE_ACCOUNT_ID "
-                "in Replit Secrets."
+                "in Streamlit secrets or the deployment environment."
             )
         models_url = models_url.replace("{account_id}", account_id)
     if provider == "Google Gemini":
@@ -666,38 +691,21 @@ def _openai_vision_request(
 def _gemini_vision_request(
     model: dict, api_key: str, image_bytes: bytes, mime: str, prompt: str
 ) -> str:
-    data = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {
-                    "inline_data": {
-                        "mime_type": mime,
-                        "data": base64.b64encode(image_bytes).decode("utf-8"),
-                    }
-                },
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1200,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
-        },
-    }
-    response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        + model["id"] + ":generateContent",
-        headers={"x-goog-api-key": api_key},
-        json=data,
-        timeout=(8, 35),
+    response = _gemini_client(api_key).models.generate_content(
+        model=model["id"],
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime),
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=1200,
+            response_mime_type="application/json",
+        ),
     )
-    response.raise_for_status()
-    body = response.json()
-    try:
-        return body["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError("Gemini returned no model response.") from exc
+    if not response.text:
+        raise RuntimeError("Gemini returned no model response.")
+    return response.text
 
 
 def _call_activated_model(
@@ -791,28 +799,18 @@ def _call_activated_text_model(
     if not api_key:
         raise RuntimeError(model["provider"] + " API key is not configured.")
     if model["kind"] == "gemini":
-        # Gemini's REST API also accepts a text-only contents payload.
-        response = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            + model["id"] + ":generateContent",
-            headers={"x-goog-api-key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.3,
-                    "maxOutputTokens": 900,
-                    "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingLevel": "MINIMAL"},
-                },
-            },
-            timeout=(8, 35),
+        response = _gemini_client(api_key).models.generate_content(
+            model=model["id"],
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=900,
+                response_mime_type="application/json",
+            ),
         )
-        response.raise_for_status()
-        body = response.json()
-        try:
-            raw = body["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("Gemini returned no model response.") from exc
+        if not response.text:
+            raise RuntimeError("Gemini returned no model response.")
+        raw = response.text
     else:
         raw = _openai_text_request(
             model, api_key, prompt, account_id_override
@@ -987,14 +985,7 @@ _TEXT_FALLBACK_DATA: dict = {
 
 def _gemini_vision(image_bytes: bytes, mime: str, extra: str) -> dict:
     """Use the configured Gemini API key to analyse the uploaded chart."""
-    from google import genai
-    from google.genai import types
-
-    api_key = get_secret("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
-    client = genai.Client(api_key=api_key)
+    client = _gemini_client()
     extra_line = (f"\n\nExtra context: {extra.strip()}") if extra.strip() else ""
     prompt = (
         CHART_PROMPT_TEXT
@@ -1033,9 +1024,7 @@ def _groq_vision(image_bytes: bytes, mime: str, extra: str,
     Image is base64-encoded and sent as a data-URI inside the OpenAI-compatible
     image_url content block — the only format Groq accepts.
     """
-    from groq import Groq
-
-    client = Groq(api_key=require_secret("GROQ_API_KEY"))
+    client = _groq_client()
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     data_uri  = f"data:{mime};base64,{b64_image}"
 
@@ -1308,8 +1297,7 @@ def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
 
 
 def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
-    from groq import Groq
-    client  = Groq(api_key=require_secret("GROQ_API_KEY"))
+    client  = _groq_client()
     prompt  = build_analyst_prompt(model_name, chart_data)
     sys_msg = {"role": "system",
                "content": "You are an expert AI trading analyst. Respond with valid JSON only. No markdown, no explanation — pure JSON."}
@@ -1372,15 +1360,8 @@ def _call_groq(model_id: str, model_name: str, chart_data: dict) -> dict:
 
 def _call_gemini(chart_data: dict) -> dict:
     """Run Gemini as an independent analyst in the committee."""
-    from google import genai
-    from google.genai import types
-
-    api_key = get_secret("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
     prompt = build_analyst_prompt(GEMINI_MODEL_LABEL, chart_data)
-    client = genai.Client(api_key=api_key)
+    client = _gemini_client()
     response = client.models.generate_content(
         model=GEMINI_MODEL_ID,
         contents=prompt,
@@ -1398,33 +1379,26 @@ def _call_gemini(chart_data: dict) -> dict:
 
 
 def _call_deepseek(chart_data: dict) -> dict:
-    api_key = require_secret("DEEPSEEK_API_KEY")
     prompt  = build_analyst_prompt("DeepSeek-Chat", chart_data)
-    resp = requests.post(
-        "https://api.deepseek.com/chat/completions",
-        headers={
-            "Authorization": "Bearer " + api_key,
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "deepseek-chat",
-            "messages": [
+    try:
+        chat = _deepseek_client().chat.completions.create(
+            model="deepseek-chat",
+            messages=[
                 {"role": "system",
                  "content": "You are an expert AI trading analyst. Respond with valid JSON only."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.4,
-            "max_tokens": 1200,
-        },
-        timeout=40,
-    )
-    if resp.status_code == 402:
-        raise RuntimeError(
-            "💳 DeepSeek is waiting for a top-up (402 Payment Required). "
-            "Skipping — remaining analysts will carry the debate."
+            temperature=0.4,
+            max_tokens=1200,
         )
-    resp.raise_for_status()
-    result = parse_json(resp.json()["choices"][0]["message"]["content"])
+    except Exception as exc:
+        if getattr(exc, "status_code", None) == 402:
+            raise RuntimeError(
+                "💳 DeepSeek is waiting for a top-up (402 Payment Required). "
+                "Skipping — remaining analysts will carry the debate."
+            ) from exc
+        raise
+    result = parse_json(chat.choices[0].message.content)
     result.setdefault("model", "DeepSeek-Chat")
     result["_platform"] = "DeepSeek"
     result["_model_id"]  = "deepseek-chat"   # stored for Round 2 deliberation
@@ -1436,8 +1410,7 @@ def _call_deepseek(chart_data: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def _call_groq_raw(model_id: str, model_name: str, prompt: str) -> dict:
     """Call Groq with a custom prompt (used for deliberation round)."""
-    from groq import Groq
-    client   = Groq(api_key=require_secret("GROQ_API_KEY"))
+    client   = _groq_client()
     sys_msg  = {"role": "system",
                 "content": "You are an AI trading analyst in a structured debate. Respond with valid JSON only."}
     user_msg = {"role": "user", "content": prompt}
@@ -1463,14 +1436,7 @@ def _call_groq_raw(model_id: str, model_name: str, prompt: str) -> dict:
 
 def _call_gemini_raw(model_name: str, prompt: str) -> dict:
     """Call Gemini with a custom prompt for the deliberation round."""
-    from google import genai
-    from google.genai import types
-
-    api_key = get_secret("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
-    client = genai.Client(api_key=api_key)
+    client = _gemini_client()
     response = client.models.generate_content(
         model=GEMINI_MODEL_ID,
         contents=prompt,
@@ -1489,24 +1455,20 @@ def _call_gemini_raw(model_name: str, prompt: str) -> dict:
 
 def _call_deepseek_raw(model_name: str, prompt: str) -> dict:
     """Call DeepSeek with a custom prompt (used for deliberation round)."""
-    api_key = require_secret("DEEPSEEK_API_KEY")
-    resp = requests.post(
-        "https://api.deepseek.com/chat/completions",
-        headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-        json={
-            "model": "deepseek-chat",
-            "messages": [
+    try:
+        chat = _deepseek_client().chat.completions.create(
+            model="deepseek-chat",
+            messages=[
                 {"role": "system", "content": "You are an AI trading analyst. Respond with valid JSON only."},
                 {"role": "user",   "content": prompt},
             ],
-            "temperature": 0.3, "max_tokens": 500,
-        },
-        timeout=40,
-    )
-    if resp.status_code == 402:
-        raise RuntimeError("DeepSeek 402")
-    resp.raise_for_status()
-    result = parse_json(resp.json()["choices"][0]["message"]["content"])
+            temperature=0.3, max_tokens=500,
+        )
+    except Exception as exc:
+        if getattr(exc, "status_code", None) == 402:
+            raise RuntimeError("DeepSeek 402") from exc
+        raise
+    result = parse_json(chat.choices[0].message.content)
     result.setdefault("model", model_name)
     result["_platform"] = "DeepSeek"
     return result
@@ -1704,14 +1666,12 @@ def step3_synthesize(chart_data: dict, analyst_votes: list[dict]) -> dict:
     Cross-examines all analyst opinions → FINAL_DECISION + candle recommendation.
     Uses the top available Groq text model.
     """
-    from groq import Groq
-
     prompt  = _build_synthesis_prompt(chart_data, analyst_votes)
     models  = _discover_groq_text_models(n=2)
     last_err = ""
     for model_id, label in models:
         try:
-            client = Groq(api_key=require_secret("GROQ_API_KEY"))
+            client = _groq_client()
             chat = client.chat.completions.create(
                 model=model_id,
                 messages=[

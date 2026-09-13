@@ -4,3 +4,6 @@ groq>=1.4.0
 requests>=2.34.2
 duckduckgo-search>=6.0.0
 Pillow>=12.2.0
+openai>=1.0.0
+openai
+sift-stack-py
