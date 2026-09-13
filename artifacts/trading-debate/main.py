@@ -841,12 +841,63 @@ def _call_activated_chat(
     return _openai_vision_request(model, api_key, image_bytes, mime, prompt)
 
 
+def _extract_user_timeframe(extra: str) -> tuple[str, int] | None:
+    """Extract an explicitly supplied candle timeframe from trader notes."""
+    text = " ".join(str(extra or "").split())
+    patterns = (
+        r"\b(\d{1,4})\s*[- ]?(?:minute|minutes|min|mins)\b",
+        r"\b(\d{1,4})\s*m(?:in)?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            minutes = int(match.group(1))
+            if 1 <= minutes <= 1440:
+                return f"{minutes}-minute", minutes
+    return None
+
+
+def _apply_user_context(chart_data: dict, extra: str) -> dict:
+    """Make trader-supplied context authoritative over visual guesses."""
+    context = str(extra or "").strip()
+    chart_data["user_context"] = context
+    timeframe = _extract_user_timeframe(context)
+    if timeframe:
+        label, minutes = timeframe
+        chart_data["timeframe"] = label
+        chart_data["timeframe_minutes"] = minutes
+        chart_data["timeframe_source"] = "Trader-provided"
+        summary = str(chart_data.get("technical_summary") or "").strip()
+        confirmation = f"Trader-confirmed chart timeframe: {label}."
+        if confirmation not in summary:
+            chart_data["technical_summary"] = (
+                confirmation + (" " + summary if summary else "")
+            )
+    return chart_data
+
+
+def _authoritative_context_block(extra: str = "") -> str:
+    context = str(extra or "").strip()
+    if not context:
+        return ""
+    return (
+        "\n\n=== TRADER-PROVIDED CONTEXT — AUTHORITATIVE ===\n"
+        + context
+        + "\n=== END TRADER-PROVIDED CONTEXT ===\n"
+        "Treat explicit asset, timeframe, session, and question details above "
+        "as facts supplied by the trader. Do not replace them with a visual guess. "
+        "Use the supplied timeframe for every hold-duration and trade recommendation, "
+        "and explicitly acknowledge it in your reasoning.\n"
+    )
+
+
 def _activated_chart_prompt(extra: str = "") -> str:
-    extra_line = ("\nTrader context: " + extra.strip()) if extra.strip() else ""
     return (
         "Read the attached trading chart image carefully. Every activated model "
         "must analyze the image itself; do not rely on another model's output. "
-        "Do not invent values that are not visible. " + extra_line + "\n\n"
+        "Do not invent chart levels that are not visible. "
+        + _authoritative_context_block(extra)
+        + "\n"
         + CHART_PROMPT_TEXT + "\n" + CHART_ANALYSIS_JSON_SPEC + "\n"
         "Also include these committee fields: "
         '"analysis":"brief chart-based analysis",'
@@ -925,7 +976,7 @@ def _activated_vote_prompt(chart_data: dict, extra: str = "") -> str:
         "with vote, confidence 0-100, analysis, key_risks, and reasoning. Be specific "
         "and acknowledge uncertainty.\n\n"
         "CHART RECORD:\n" + json.dumps(safe_data, ensure_ascii=False, default=str)
-        + ("\nTRADER CONTEXT:\n" + extra.strip() if extra.strip() else "")
+        + _authoritative_context_block(extra)
     )
 
 
@@ -1214,9 +1265,11 @@ def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
     user_ctx = (g.get("user_context") or "").strip()
     user_section = (
         "══════════════════════════════════════════════════════\n"
-        "  ⚠️  TRADER'S NOTES — READ AND FOLLOW THESE CAREFULLY\n"
+        "  ⚠️  TRADER'S NOTES — AUTHORITATIVE; READ BEFORE ANALYSING\n"
         "══════════════════════════════════════════════════════\n"
-        + user_ctx + "\n\n"
+        + user_ctx + "\n"
+        "Treat the trader's explicit timeframe and question as facts. "
+        "Do not substitute a timeframe guessed from the image.\n\n"
     ) if user_ctx else ""
 
     if short:
@@ -1474,7 +1527,12 @@ def _call_deepseek_raw(model_name: str, prompt: str) -> dict:
     return result
 
 
-def _build_deliberation_prompt(model_name: str, all_votes: list[dict]) -> str:
+def _build_deliberation_prompt(
+    model_name: str,
+    all_votes: list[dict],
+    user_context: str = "",
+    timeframe: str = "",
+) -> str:
     """
     Build the Round 2 prompt for one analyst: it sees every peer's
     vote + full reasoning from Round 1, then submits its final position.
@@ -1494,9 +1552,18 @@ def _build_deliberation_prompt(model_name: str, all_votes: list[dict]) -> str:
     majority = Counter(v.get("vote", "WAIT") for v in all_votes).most_common(1)[0][0]
     own_vote = next((v.get("vote", "?")
                      for v in all_votes if v.get("model") == model_name), "?")
+    context_block = _authoritative_context_block(user_context)
+    timeframe_line = (
+        "Trader-confirmed timeframe: " + timeframe + ". Keep this timeframe in "
+        "your revised vote and recommendation.\n\n"
+        if timeframe
+        else ""
+    )
     return (
         "You are " + model_name + ", participating in a structured AI trading debate.\n"
-        "All analysts have submitted their Round 1 positions. "
+        + context_block
+        + timeframe_line
+        + "All analysts have submitted their Round 1 positions. "
         "Now read every peer's full reasoning below.\n\n"
         "=== ROUND 1 — ALL ANALYST POSITIONS ===\n"
         + positions
@@ -1517,12 +1584,17 @@ def _build_deliberation_prompt(model_name: str, all_votes: list[dict]) -> str:
     )
 
 
-def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
+def run_deliberation_round(
+    analyst_votes: list[dict], chart_data: dict | None = None
+) -> list[dict]:
     """
     Round 2: every analyst sees all peers' full reasoning and gives a
     final vote.  Falls back to Round 1 result on any API failure.
     Returns a list in the same format as analyst_votes.
     """
+    chart_data = chart_data or {}
+    user_context = str(chart_data.get("user_context") or "")
+    timeframe = str(chart_data.get("timeframe") or "")
     credentials: dict[str, tuple[str, str]] = {}
     for vote in analyst_votes:
         active_model = vote.get("_active_model")
@@ -1548,7 +1620,9 @@ def run_deliberation_round(analyst_votes: list[dict]) -> list[dict]:
         api_key, account_id = credentials.get(
             active_model.get("provider", platform), ("", "")
         )
-        prompt = _build_deliberation_prompt(model_name, analyst_votes)
+        prompt = _build_deliberation_prompt(
+            model_name, analyst_votes, user_context, timeframe
+        )
         r = _call_activated_text_model(
             active_model, prompt, api_key, account_id
         )
@@ -1621,8 +1695,10 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         )
 
     user_section = (
-        "=== TRADER'S NOTES (follow these — they override defaults) ===\n"
+        "=== TRADER'S NOTES — AUTHORITATIVE (follow these exactly) ===\n"
         + user_ctx + "\n"
+        "The trader's explicit timeframe and question are facts. "
+        "Do not replace them with a timeframe inferred from the image.\n"
         "=============================================================\n\n"
     ) if user_ctx else ""
 
@@ -1635,6 +1711,8 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         + positions
         + "================================================\n\n"
         "Your tasks:\n"
+        "0. CONTEXT CHECK — explicitly use the trader-provided notes and timeframe "
+        "in the moderator_note and recommended_action.display_text.\n"
         "1. CROSS-EXAMINE — summarise key agreements and disagreements in 3-4 sentences.\n"
         "2. FINAL_DECISION — choose UP, DOWN, or WAIT based on weight of evidence.\n"
         "3. RECOMMENDED_ACTION — give a concrete, timeframe-specific trade instruction:\n"
@@ -1748,6 +1826,16 @@ def _normalise_synthesis(
         else "The committee is divided or lacks a clear edge. Wait for confirmation "
         "from price action before entering a position."
     )
+    user_context = str(chart_data.get("user_context") or "").strip()
+    timeframe = str(chart_data.get("timeframe") or "").strip()
+    if user_context and timeframe:
+        acknowledgement = (
+            f"Using the trader-provided {timeframe} timeframe."
+        )
+        if timeframe.casefold() not in result["moderator_note"].casefold():
+            result["moderator_note"] = (
+                acknowledgement + " " + result["moderator_note"]
+            )
     action = result.get("recommended_action")
     if not isinstance(action, dict):
         action = {}
@@ -1771,6 +1859,10 @@ def _normalise_synthesis(
             else "WAIT — no clear majority signal.",
         ),
     )
+    if user_context and timeframe:
+        display_text = str(action.get("display_text") or "")
+        if timeframe.casefold() not in display_text.casefold():
+            action["display_text"] = f"{timeframe} chart — {display_text}"
     result["recommended_action"] = action
     if error:
         result.setdefault("_synth_error", error[:240])
@@ -2649,8 +2741,8 @@ if run:
         chart_data, vision_status = step1_analyze_chart(image_bytes, mime_type, extra_ctx)
 
     asset_name = chart_data.get("asset", "asset")
-    # Store trader's extra context in chart_data so ALL prompts can see it
-    chart_data["user_context"] = extra_ctx.strip() if extra_ctx else ""
+    # Store notes and make explicit trader-supplied timeframe authoritative.
+    chart_data = _apply_user_context(chart_data, extra_ctx)
 
     with st.spinner("🌐 Searching latest market news for " + asset_name + "…"):
         chart_data = _inject_real_news(chart_data)
@@ -2756,7 +2848,7 @@ render_scoreboard(chart_data, analyst_votes, [])
 # ══════════════════════════════════════════════════════════════════════════════
 if run:
     with st.spinner("🔄 Running deliberation round — AIs reading each other's reasoning…"):
-        revised_votes = run_deliberation_round(analyst_votes)
+        revised_votes = run_deliberation_round(analyst_votes, chart_data)
 else:
     revised_votes = cached_debate["revised_votes"]
 
