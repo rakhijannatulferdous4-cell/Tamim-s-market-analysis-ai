@@ -13,8 +13,11 @@ Step 3  Final Verdict : Top Groq text model synthesis
                         → FINAL_DECISION + candle recommendation box
 """
 
+from __future__ import annotations
+
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 from html import escape
 import json
 import os
@@ -884,10 +887,14 @@ def _authoritative_context_block(extra: str = "") -> str:
         "\n\n=== TRADER-PROVIDED CONTEXT — AUTHORITATIVE ===\n"
         + context
         + "\n=== END TRADER-PROVIDED CONTEXT ===\n"
-        "Treat explicit asset, timeframe, session, and question details above "
-        "as facts supplied by the trader. Do not replace them with a visual guess. "
+        "The text between those markers is required input, not optional metadata. "
+        "Read every quoted sentence and direct question before analysing. Treat "
+        "explicit asset, timeframe, session, and question details above as facts "
+        "supplied by the trader. Do not replace them with a visual guess. "
         "Use the supplied timeframe for every hold-duration and trade recommendation, "
-        "and explicitly acknowledge it in your reasoning.\n"
+        "and explicitly acknowledge it in your reasoning. If the trader asks where "
+        "or whether to trade, answer that question directly with UP, DOWN, or WAIT, "
+        "the relevant chart level or condition when available, and the reason.\n"
     )
 
 
@@ -1269,7 +1276,8 @@ def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
         "══════════════════════════════════════════════════════\n"
         + user_ctx + "\n"
         "Treat the trader's explicit timeframe and question as facts. "
-        "Do not substitute a timeframe guessed from the image.\n\n"
+        "Do not substitute a timeframe guessed from the image. Answer the trader's "
+        "direct question instead of giving a generic chart summary.\n\n"
     ) if user_ctx else ""
 
     if short:
@@ -1326,7 +1334,9 @@ def build_analyst_prompt(model_name: str, g: dict, short: bool = False) -> str:
         "══════════════════════════════════════════════════════\n"
         "  SECTION 3 — YOUR ANALYSIS CHECKLIST (answer all 8)\n"
         "══════════════════════════════════════════════════════\n"
-        "Work through each point; summarise findings in the 'analysis' field:\n\n"
+        "Work through each point; summarise findings in the 'analysis' field. "
+        "Then answer the trader's direct question from the notes explicitly in "
+        "that analysis and reasoning; do not ignore or paraphrase it away.\n\n"
         "1. TREND STRUCTURE — uptrend, downtrend, or range? Higher highs/lows?\n"
         "2. RSI — overbought (>70), oversold (<30), neutral? Divergence?\n"
         "3. MACD — bullish or bearish crossover? Histogram expanding or contracting?\n"
@@ -1698,7 +1708,9 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         "=== TRADER'S NOTES — AUTHORITATIVE (follow these exactly) ===\n"
         + user_ctx + "\n"
         "The trader's explicit timeframe and question are facts. "
-        "Do not replace them with a timeframe inferred from the image.\n"
+        "Do not replace them with a timeframe inferred from the image. "
+        "Answer the trader's direct question explicitly in moderator_note and "
+        "recommended_action.display_text.\n"
         "=============================================================\n\n"
     ) if user_ctx else ""
 
@@ -1711,8 +1723,9 @@ def _build_synthesis_prompt(chart_data: dict, analyst_votes: list[dict]) -> str:
         + positions
         + "================================================\n\n"
         "Your tasks:\n"
-        "0. CONTEXT CHECK — explicitly use the trader-provided notes and timeframe "
-        "in the moderator_note and recommended_action.display_text.\n"
+        "0. CONTEXT CHECK — read every quoted note and direct question. Explicitly "
+        "answer the trader's question, use the supplied timeframe, and include both "
+        "in moderator_note and recommended_action.display_text.\n"
         "1. CROSS-EXAMINE — summarise key agreements and disagreements in 3-4 sentences.\n"
         "2. FINAL_DECISION — choose UP, DOWN, or WAIT based on weight of evidence.\n"
         "3. RECOMMENDED_ACTION — give a concrete, timeframe-specific trade instruction:\n"
@@ -2541,6 +2554,696 @@ def render_trade_recommendation(synth: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LIVE CANDLESTICK ENGINE — Exness / Quotex market-data mode
+# ─────────────────────────────────────────────────────────────────────────────
+_LIVE_MARKETS = {
+    "EUR/USD": {"yahoo": "EURUSD=X", "mt5": "EURUSD", "ccxt": None},
+    "GBP/USD": {"yahoo": "GBPUSD=X", "mt5": "GBPUSD", "ccxt": None},
+    "USD/JPY": {"yahoo": "JPY=X", "mt5": "USDJPY", "ccxt": None},
+    "AUD/USD": {"yahoo": "AUDUSD=X", "mt5": "AUDUSD", "ccxt": None},
+    "USD/CAD": {"yahoo": "CAD=X", "mt5": "USDCAD", "ccxt": None},
+    "Gold (XAU/USD)": {"yahoo": "GC=F", "mt5": "XAUUSD", "ccxt": None},
+    "BTC/USDT": {"yahoo": "BTC-USD", "mt5": "BTCUSD", "ccxt": "BTC/USDT"},
+}
+
+_LIVE_TIMEFRAMES = {
+    "1m": {"yahoo": "1m", "minutes": 1, "period": "5d", "ccxt": "1m"},
+    "5m": {"yahoo": "5m", "minutes": 5, "period": "60d", "ccxt": "5m"},
+    "15m": {"yahoo": "15m", "minutes": 15, "period": "60d", "ccxt": "15m"},
+    "1h": {"yahoo": "1h", "minutes": 60, "period": "730d", "ccxt": "1h"},
+}
+
+
+def _live_interval_config(timeframe: str) -> dict:
+    return _LIVE_TIMEFRAMES.get(timeframe, _LIVE_TIMEFRAMES["5m"])
+
+
+def _normalise_market_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert yfinance/ccxt output into a consistent OHLCV dataframe."""
+    if frame is None or frame.empty:
+        raise RuntimeError("The market connector returned no candle data.")
+    frame = frame.copy()
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [str(column[0]) for column in frame.columns]
+    frame.columns = [str(column).strip().lower() for column in frame.columns]
+    aliases = {
+        "adj close": "close",
+        "datetime": "timestamp",
+        "date": "timestamp",
+    }
+    frame = frame.rename(columns=aliases)
+    if "timestamp" in frame.columns:
+        frame.index = pd.to_datetime(frame.pop("timestamp"), utc=True)
+    else:
+        frame.index = pd.to_datetime(frame.index, utc=True)
+    for column in ("open", "high", "low", "close", "volume"):
+        if column not in frame.columns:
+            frame[column] = 0.0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame[["open", "high", "low", "close", "volume"]].dropna(
+        subset=["open", "high", "low", "close"]
+    )
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+    if frame.empty:
+        raise RuntimeError("The market connector returned invalid OHLC values.")
+    return frame.tail(240)
+
+
+def _fetch_mt5_market_data(
+    symbol: str, timeframe: str, login: str, password: str, server: str
+) -> tuple[pd.DataFrame | None, str]:
+    """Try the optional MT5 bridge without making Streamlit Cloud depend on it."""
+    if not login.strip() or not password.strip() or not server.strip():
+        return None, ""
+    try:
+        import MetaTrader5 as mt5
+    except Exception:
+        return None, (
+            "MT5 bridge is not available in this Streamlit Cloud runtime; "
+            "public market fallback was used."
+        )
+    timeframe_map = {
+        "1m": getattr(mt5, "TIMEFRAME_M1", None),
+        "5m": getattr(mt5, "TIMEFRAME_M5", None),
+        "15m": getattr(mt5, "TIMEFRAME_M15", None),
+        "1h": getattr(mt5, "TIMEFRAME_H1", None),
+    }
+    try:
+        login_id = int(login.strip())
+    except ValueError:
+        return None, "MT5 Account Login ID must be numeric; public market fallback was used."
+    try:
+        if not mt5.initialize(
+            login=login_id, password=password, server=server.strip()
+        ):
+            return None, "MT5 connection failed; public market fallback was used."
+        rates = mt5.copy_rates_from_pos(
+            symbol, timeframe_map.get(timeframe), 0, 240
+        )
+        if rates is None or len(rates) == 0:
+            return None, "MT5 returned no candles; public market fallback was used."
+        frame = pd.DataFrame(rates).rename(columns={"time": "timestamp"})
+        return _normalise_market_frame(frame), "Exness MT5"
+    except Exception as exc:
+        return None, "MT5 request failed; public market fallback was used."
+    finally:
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+
+
+def _fetch_public_market_data(pair: str, timeframe: str) -> tuple[pd.DataFrame, str]:
+    """Fetch public candles through yfinance first, then ccxt for supported pairs."""
+    market = _LIVE_MARKETS[pair]
+    interval = _live_interval_config(timeframe)
+    errors: list[str] = []
+    try:
+        frame = yf.download(
+            market["yahoo"],
+            period=interval["period"],
+            interval=interval["yahoo"],
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        return _normalise_market_frame(frame), "Yahoo Finance public feed"
+    except Exception as exc:
+        errors.append("yfinance: " + _safe_error(exc))
+
+    if ccxt is not None and market.get("ccxt"):
+        try:
+            exchange = ccxt.binance({"enableRateLimit": True})
+            rows = exchange.fetch_ohlcv(
+                market["ccxt"], timeframe=interval["ccxt"], limit=240
+            )
+            frame = pd.DataFrame(
+                rows, columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+            return _normalise_market_frame(frame), "Binance public feed via ccxt"
+        except Exception as exc:
+            errors.append("ccxt: " + _safe_error(exc))
+    raise RuntimeError(
+        "No public candle connector returned data. " + " | ".join(errors)[:360]
+    )
+
+
+def _add_market_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    close = frame["close"]
+    frame["sma_20"] = close.rolling(20, min_periods=1).mean()
+    frame["ema_9"] = close.ewm(span=9, adjust=False, min_periods=1).mean()
+    frame["ema_21"] = close.ewm(span=21, adjust=False, min_periods=1).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=1).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=1).mean()
+    frame["rsi_14"] = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    frame["rsi_14"] = frame["rsi_14"].fillna(50.0).clip(0, 100)
+    frame["macd"] = close.ewm(span=12, adjust=False, min_periods=1).mean() - close.ewm(
+        span=26, adjust=False, min_periods=1
+    ).mean()
+    frame["macd_signal"] = frame["macd"].ewm(
+        span=9, adjust=False, min_periods=1
+    ).mean()
+    frame["macd_histogram"] = frame["macd"] - frame["macd_signal"]
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - previous_close).abs(),
+            (frame["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    frame["atr_14"] = true_range.rolling(14, min_periods=1).mean()
+    return frame.replace([np.inf, -np.inf], np.nan).ffill().bfill()
+
+
+def _load_live_market(
+    pair: str,
+    timeframe: str,
+    mt5_login: str = "",
+    mt5_password: str = "",
+    mt5_server: str = "",
+) -> dict:
+    frame, source = _fetch_mt5_market_data(
+        _LIVE_MARKETS[pair].get("mt5", pair),
+        timeframe,
+        mt5_login,
+        mt5_password,
+        mt5_server,
+    )
+    notice = ""
+    if frame is None:
+        frame, source = _fetch_public_market_data(pair, timeframe)
+        notice = source if "fallback" in source.lower() else ""
+    frame = _add_market_indicators(frame)
+    latest = frame.iloc[-1]
+    indicator_metrics = {
+        "RSI (14)": round(float(latest["rsi_14"]), 2),
+        "SMA (20)": round(float(latest["sma_20"]), 6),
+        "EMA (9)": round(float(latest["ema_9"]), 6),
+        "EMA (21)": round(float(latest["ema_21"]), 6),
+        "MACD": round(float(latest["macd"]), 6),
+        "MACD signal": round(float(latest["macd_signal"]), 6),
+        "ATR (14)": round(float(latest["atr_14"]), 6),
+    }
+    return {
+        "pair": pair,
+        "timeframe": timeframe,
+        "timeframe_minutes": _live_interval_config(timeframe)["minutes"],
+        "source": source,
+        "notice": notice,
+        "frame": frame,
+        "latest": {
+            key: float(latest[key])
+            for key in ("open", "high", "low", "close", "volume")
+        },
+        "indicator_metrics": indicator_metrics,
+    }
+
+
+def _live_serialisable_data(market: dict) -> dict:
+    frame = market["frame"].tail(80)
+    candles = []
+    for timestamp, row in frame.iterrows():
+        candles.append(
+            {
+                "timestamp": timestamp.isoformat(),
+                "open": round(float(row["open"]), 8),
+                "high": round(float(row["high"]), 8),
+                "low": round(float(row["low"]), 8),
+                "close": round(float(row["close"]), 8),
+                "volume": round(float(row["volume"]), 4),
+                "rsi_14": round(float(row["rsi_14"]), 4),
+                "ema_9": round(float(row["ema_9"]), 8),
+                "ema_21": round(float(row["ema_21"]), 8),
+                "macd": round(float(row["macd"]), 8),
+                "macd_signal": round(float(row["macd_signal"]), 8),
+            }
+        )
+    return {
+        "pair": market["pair"],
+        "timeframe": market["timeframe"],
+        "timeframe_minutes": market["timeframe_minutes"],
+        "source": market["source"],
+        "latest": market["latest"],
+        "indicator_metrics": market["indicator_metrics"],
+        "recent_candles": candles,
+    }
+
+
+def _build_live_prediction_prompt(market: dict) -> str:
+    payload = json.dumps(_live_serialisable_data(market), ensure_ascii=False)
+    return (
+        "You are an active member of a multi-AI market prediction committee for "
+        "Exness and Quotex traders. Analyze the supplied OHLCV candles and indicator "
+        "metrics; do not claim to see an image. The market and timeframe in the data "
+        "are authoritative. Return a directional vote and a numerical forecast for "
+        "the next 4 candles. Use realistic OHLC relationships: high must be at least "
+        "max(open, close), and low must be at most min(open, close). "
+        "Do not invent a different pair or timeframe.\n\n"
+        "MARKET DATA:\n"
+        + payload
+        + "\n\nReturn ONLY valid JSON:\n"
+        "{"
+        '"vote":"UP|DOWN|WAIT",'
+        '"confidence":0-100,'
+        '"analysis":"concise evidence from price and indicators",'
+        '"key_risks":["specific risk"],'
+        '"prediction_candles":['
+        '{"candle_number":1,"open":0,"high":0,"low":0,"close":0},'
+        '{"candle_number":2,"open":0,"high":0,"low":0,"close":0},'
+        '{"candle_number":3,"open":0,"high":0,"low":0,"close":0},'
+        '{"candle_number":4,"open":0,"high":0,"low":0,"close":0}'
+        "]}"
+    )
+
+
+def _live_fallback_candles(market: dict, vote: str = "WAIT") -> list[dict]:
+    latest = market["latest"]
+    close = float(latest["close"])
+    atr = max(float(market["indicator_metrics"].get("ATR (14)", 0) or 0), close * 0.0002)
+    direction = 1 if vote == "UP" else (-1 if vote == "DOWN" else 0)
+    candles = []
+    previous = close
+    for number in range(1, 5):
+        opening = previous
+        movement = direction * atr * 0.35
+        closing = max(0.00000001, opening + movement)
+        high = max(opening, closing) + atr * 0.18
+        low = max(0.00000001, min(opening, closing) - atr * 0.18)
+        candles.append(
+            {
+                "candle_number": number,
+                "open": opening,
+                "high": high,
+                "low": low,
+                "close": closing,
+            }
+        )
+        previous = closing
+    return candles
+
+
+def _normalise_live_prediction(result: dict, market: dict, model: dict) -> dict:
+    result = dict(result or {})
+    result.setdefault("model", model.get("name", model.get("id", "AI model")))
+    result.setdefault("_active_model", model)
+    vote = _normalise_vote_fields(result, "Market-data analysis completed.")["vote"]
+    raw_candles = (
+        result.get("prediction_candles")
+        or result.get("predicted_candles")
+        or result.get("forecast_candles")
+        or result.get("forecast")
+        or []
+    )
+    if isinstance(raw_candles, dict):
+        raw_candles = raw_candles.get("candles", [])
+    candles = []
+    if isinstance(raw_candles, list):
+        for index, raw in enumerate(raw_candles[:4], start=1):
+            if not isinstance(raw, dict):
+                continue
+            values = {}
+            for key in ("open", "high", "low", "close"):
+                try:
+                    values[key] = float(raw.get(key))
+                except (TypeError, ValueError):
+                    values = {}
+                    break
+            if not values or min(values.values()) <= 0:
+                continue
+            values["candle_number"] = index
+            values["high"] = max(values["high"], values["open"], values["close"])
+            values["low"] = min(values["low"], values["open"], values["close"])
+            candles.append(values)
+    if len(candles) < 2:
+        candles = _live_fallback_candles(market, vote)
+        result["forecast_source"] = "Deterministic volatility fallback"
+    else:
+        result["forecast_source"] = "AI forecast"
+    result["vote"] = vote
+    result["prediction_candles"] = candles
+    result["confidence"] = max(0, min(100, int(result.get("confidence", 50) or 50)))
+    return result
+
+
+def _run_live_prediction_round(market: dict, models: list[dict]) -> list[dict]:
+    prompt = _build_live_prediction_prompt(market)
+    credentials = {
+        provider: (_provider_key(provider), _provider_account_id(provider))
+        for provider in {model.get("provider", "") for model in models}
+    }
+
+    def run_model(model: dict) -> dict:
+        provider_key, account_id = credentials.get(model.get("provider", ""), ("", ""))
+        result = _call_activated_text_model(
+            model, prompt, provider_key, account_id
+        )
+        return _normalise_live_prediction(result, market, model)
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(models)))) as pool:
+        futures = {pool.submit(run_model, model): model for model in models}
+        for future, model in futures.items():
+            try:
+                results.append(future.result())
+            except Exception:
+                _retire_model(model)
+    return results
+
+
+def _build_live_deliberation_prompt(market: dict, votes: list[dict]) -> str:
+    positions = []
+    for vote in votes:
+        positions.append(
+            {
+                "model": vote.get("model", "?"),
+                "vote": vote.get("vote", "WAIT"),
+                "confidence": vote.get("confidence", 0),
+                "analysis": vote.get("analysis", ""),
+                "key_risks": vote.get("key_risks", []),
+                "prediction_candles": vote.get("prediction_candles", []),
+            }
+        )
+    return (
+        "You are revising your forecast after cross-examining every peer in a "
+        "multi-AI trading debate. The pair and timeframe are authoritative. Compare "
+        "the evidence and numerical forecasts, correct unrealistic OHLC values, then "
+        "return your final vote and 2 to 4 predicted candles. Keep the prediction "
+        "grounded in the latest OHLCV data and indicators.\n\n"
+        "MARKET DATA:\n"
+        + json.dumps(_live_serialisable_data(market), ensure_ascii=False)
+        + "\n\nPEER POSITIONS:\n"
+        + json.dumps(positions, ensure_ascii=False)
+        + "\n\nReturn ONLY valid JSON with vote, confidence, analysis, key_risks, "
+        "and prediction_candles."
+    )
+
+
+def _run_live_deliberation_round(market: dict, votes: list[dict]) -> list[dict]:
+    prompt = _build_live_deliberation_prompt(market, votes)
+    credentials = {
+        provider: (_provider_key(provider), _provider_account_id(provider))
+        for provider in {model.get("provider", "") for model in votes
+                         for model in [model.get("_active_model") or {}]}
+    }
+
+    def deliberate(vote: dict) -> dict:
+        model = vote.get("_active_model")
+        if not isinstance(model, dict):
+            return vote
+        provider_key, account_id = credentials.get(model.get("provider", ""), ("", ""))
+        result = _call_activated_text_model(
+            model, prompt, provider_key, account_id
+        )
+        return _normalise_live_prediction(result, market, model)
+
+    revised: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(votes)))) as pool:
+        futures = {pool.submit(deliberate, vote): vote for vote in votes}
+        for future, vote in futures.items():
+            try:
+                revised.append(future.result())
+            except Exception:
+                revised.append(vote)
+    return revised
+
+
+def _build_live_consensus(market: dict, votes: list[dict]) -> dict:
+    tally = {"UP": 0, "DOWN": 0, "WAIT": 0}
+    for vote in votes:
+        direction = str(vote.get("vote", "WAIT")).upper()
+        tally[direction if direction in tally else "WAIT"] += 1
+    ordered = sorted(tally.items(), key=lambda item: item[1], reverse=True)
+    decision = ordered[0][0] if ordered and (
+        len(ordered) == 1 or ordered[0][1] > ordered[1][1]
+    ) else "WAIT"
+    total = sum(tally.values())
+    confidence = int(round(100 * tally.get(decision, 0) / total)) if total else 0
+    lengths = [
+        len(vote.get("prediction_candles", []))
+        for vote in votes
+        if vote.get("prediction_candles")
+    ]
+    count = min(max(lengths or [4]), 4)
+    if count < 2:
+        count = 2
+    consensus = []
+    fallback = _live_fallback_candles(market, decision)
+    for index in range(count):
+        values = []
+        for vote in votes:
+            candles = vote.get("prediction_candles", [])
+            if index < len(candles):
+                values.append(candles[index])
+        source = values or [fallback[index]]
+        candle = {
+            "candle_number": index + 1,
+            "open": float(np.median([item["open"] for item in source])),
+            "high": float(np.median([item["high"] for item in source])),
+            "low": float(np.median([item["low"] for item in source])),
+            "close": float(np.median([item["close"] for item in source])),
+        }
+        candle["high"] = max(candle["high"], candle["open"], candle["close"])
+        candle["low"] = min(candle["low"], candle["open"], candle["close"])
+        consensus.append(candle)
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "vote_tally": tally,
+        "prediction_candles": consensus,
+        "models_count": len(votes),
+    }
+
+
+def _live_prediction_frame(market: dict, consensus: list[dict]) -> pd.DataFrame:
+    frame = market["frame"]
+    if not consensus:
+        return pd.DataFrame()
+    step = timedelta(minutes=market["timeframe_minutes"])
+    start = frame.index[-1] + step
+    index = pd.date_range(start=start, periods=len(consensus), freq=step)
+    return pd.DataFrame(consensus, index=index)
+
+
+def _build_live_figure(market: dict, consensus: list[dict]) -> go.Figure:
+    from plotly.subplots import make_subplots
+
+    frame = market["frame"].tail(160)
+    predicted = _live_prediction_frame(market, consensus)
+    figure = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.035,
+        row_heights=[0.53, 0.13, 0.17, 0.17],
+        subplot_titles=("OHLCV + Moving Averages", "Volume", "RSI (14)", "MACD"),
+    )
+    figure.add_trace(
+        go.Candlestick(
+            x=frame.index,
+            open=frame["open"],
+            high=frame["high"],
+            low=frame["low"],
+            close=frame["close"],
+            name="Live candles",
+            increasing_line_color="#00d084",
+            decreasing_line_color="#ff4d6d",
+        ),
+        row=1,
+        col=1,
+    )
+    for column, color in (
+        ("sma_20", "#ffd166"),
+        ("ema_9", "#00b4ff"),
+        ("ema_21", "#c77dff"),
+    ):
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame[column],
+                mode="lines",
+                name=column.upper().replace("_", " "),
+                line={"color": color, "width": 1.4},
+            ),
+            row=1,
+            col=1,
+        )
+    figure.add_trace(
+        go.Bar(x=frame.index, y=frame["volume"], name="Volume", marker_color="#4c6fff"),
+        row=2,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=frame.index,
+            y=frame["rsi_14"],
+            name="RSI",
+            line={"color": "#ff9f1c", "width": 1.5},
+        ),
+        row=3,
+        col=1,
+    )
+    figure.add_hline(y=70, line_dash="dot", line_color="#ff4d6d", row=3, col=1)
+    figure.add_hline(y=30, line_dash="dot", line_color="#00d084", row=3, col=1)
+    figure.add_trace(
+        go.Scatter(
+            x=frame.index,
+            y=frame["macd"],
+            name="MACD",
+            line={"color": "#00b4ff", "width": 1.5},
+        ),
+        row=4,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=frame.index,
+            y=frame["macd_signal"],
+            name="MACD signal",
+            line={"color": "#ff9f1c", "width": 1.2},
+        ),
+        row=4,
+        col=1,
+    )
+    if not predicted.empty:
+        figure.add_trace(
+            go.Candlestick(
+                x=predicted.index,
+                open=predicted["open"],
+                high=predicted["high"],
+                low=predicted["low"],
+                close=predicted["close"],
+                name="AI predicted candles",
+                increasing_line_color="#ffe066",
+                decreasing_line_color="#ff8fab",
+                increasing_fillcolor="#6c5ce7",
+                decreasing_fillcolor="#6c5ce7",
+                opacity=0.9,
+            ),
+            row=1,
+            col=1,
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=predicted.index,
+                y=predicted["close"],
+                name="Consensus close path",
+                mode="lines+markers",
+                line={"color": "#ffe066", "width": 2, "dash": "dash"},
+                marker={"size": 7, "symbol": "diamond"},
+            ),
+            row=1,
+            col=1,
+        )
+    figure.update_layout(
+        height=820,
+        template="plotly_dark",
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        xaxis_rangeslider_visible=False,
+        legend={"orientation": "h", "y": 1.02, "x": 0},
+        hovermode="x unified",
+    )
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(130,150,180,.16)")
+    return figure
+
+
+def _render_live_engine(result: dict) -> None:
+    market = result["market"]
+    consensus = result.get("consensus", {})
+    st.markdown("---")
+    st.markdown(
+        "<div class='step-header'>📈 Live Candlestick Charting & Multi-AI "
+        "Prediction Engine</div>",
+        unsafe_allow_html=True,
+    )
+    source = escape(str(market.get("source", "public feed")))
+    st.caption(
+        f"{market['pair']} · {market['timeframe']} candles · Data source: {source} · "
+        "Forecast candles are model estimates, not broker execution instructions."
+    )
+    if market.get("notice"):
+        st.info(market["notice"])
+    metrics = market["indicator_metrics"]
+    metric_columns = st.columns(5)
+    for column, label in zip(
+        metric_columns,
+        ("RSI (14)", "EMA (9)", "EMA (21)", "MACD", "ATR (14)"),
+    ):
+        column.metric(label, str(metrics[label]))
+    st.plotly_chart(
+        _build_live_figure(market, consensus.get("prediction_candles", [])),
+        use_container_width=True,
+        key="live_market_chart",
+    )
+    votes = result.get("revised_votes", [])
+    if not votes:
+        st.warning(
+            "Live candles are available. Connect and activate AI models in the "
+            "sidebar to generate the multi-AI forecast overlay."
+        )
+        return
+    decision = consensus.get("decision", "WAIT")
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Consensus", decision)
+    summary_columns[1].metric("Confidence", str(consensus.get("confidence", 0)) + "%")
+    summary_columns[2].metric("Models", str(consensus.get("models_count", 0)))
+    summary_columns[3].metric(
+        "Forecast horizon",
+        str(len(consensus.get("prediction_candles", []))) + " candles",
+    )
+    with st.expander("AI debate breakdown", expanded=True):
+        st.write(
+            "Round 1 forecasts are cross-examined in Round 2. The overlay uses the "
+            "median OHLC forecast from the post-debate model positions."
+        )
+        for vote in votes:
+            label = vote.get("model", "AI model")
+            platform = vote.get("_platform", "")
+            st.markdown(
+                f"**{escape(str(label))} · {escape(str(platform))}** — "
+                f"**{vote.get('vote', 'WAIT')}** · {vote.get('confidence', 0)}%"
+            )
+            st.caption(str(vote.get("analysis") or vote.get("reasoning") or "No explanation returned."))
+            st.dataframe(
+                pd.DataFrame(vote.get("prediction_candles", [])),
+                use_container_width=True,
+                hide_index=True,
+            )
+    st.markdown("**Consensus predicted candles**")
+    st.dataframe(
+        pd.DataFrame(consensus.get("prediction_candles", [])),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "Educational market analysis only. Forecasts can be wrong; verify price, "
+        "spread, liquidity, and broker conditions before making any decision."
+    )
+
+
+def _run_live_engine(request: dict, models: list[dict]) -> dict:
+    market = _load_live_market(
+        request["pair"],
+        request["timeframe"],
+        request.get("mt5_login", ""),
+        request.get("mt5_password", ""),
+        request.get("mt5_server", ""),
+    )
+    round_one = _run_live_prediction_round(market, models) if models else []
+    revised = _run_live_deliberation_round(market, round_one) if round_one else []
+    consensus = _build_live_consensus(market, revised)
+    return {
+        "market": market,
+        "round_one": round_one,
+        "revised_votes": revised,
+        "consensus": consensus,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sidebar — secure provider/model manager
 # ─────────────────────────────────────────────────────────────────────────────
 if "provider_keys" not in st.session_state:
@@ -2802,7 +3505,7 @@ if run:
                 result, "The uploaded chart was read by " + model["name"] + "."
             )
         if model.get("vision"):
-            return _call_activated_model(
+            result = _call_activated_model(
                 model,
                 image_bytes,
                 mime_type,
@@ -2810,11 +3513,19 @@ if run:
                 provider_key,
                 account_id,
             )
-        return _call_activated_text_model(
+            return _normalise_vote_fields(
+                _apply_user_context(result, extra_ctx),
+                "The uploaded chart was read by " + model["name"] + ".",
+            )
+        result = _call_activated_text_model(
             model,
             _activated_vote_prompt(chart_data, extra_ctx),
             provider_key,
             account_id,
+        )
+        return _normalise_vote_fields(
+            _apply_user_context(result, extra_ctx),
+            "The structured chart record was reviewed by " + model["name"] + ".",
         )
 
     # Parallel requests keep a slow Gemini model from delaying fast Groq models.
