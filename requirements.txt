@@ -7,3 +7,8 @@ Pillow>=12.2.0
 openai>=1.0.0
 openai
 sift-stack-py
+numpy>=2.0.0
+pandas>=2.2.0
+plotly>=5.24.0
+yfinance>=0.2.54
+ccxt>=4.4.0

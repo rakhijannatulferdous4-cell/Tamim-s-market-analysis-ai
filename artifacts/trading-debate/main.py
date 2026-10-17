@@ -24,6 +24,9 @@ import os
 import re
 import time
 
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from PIL import Image
@@ -31,6 +34,16 @@ from google import genai
 from google.genai import types
 from groq import Groq
 from openai import OpenAI
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+try:
+    import ccxt
+except Exception:
+    ccxt = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config — sidebar expanded so the model manager is immediately visible
@@ -2569,9 +2582,67 @@ _LIVE_MARKETS = {
 _LIVE_TIMEFRAMES = {
     "1m": {"yahoo": "1m", "minutes": 1, "period": "5d", "ccxt": "1m"},
     "5m": {"yahoo": "5m", "minutes": 5, "period": "60d", "ccxt": "5m"},
+    "10m": {
+        "yahoo": "5m",
+        "minutes": 10,
+        "period": "60d",
+        "ccxt": "10m",
+        "resample_yahoo": True,
+    },
     "15m": {"yahoo": "15m", "minutes": 15, "period": "60d", "ccxt": "15m"},
     "1h": {"yahoo": "1h", "minutes": 60, "period": "730d", "ccxt": "1h"},
 }
+
+
+def _infer_live_market_request(
+    user_context: str = "", chart_data: dict | None = None
+) -> dict:
+    """Infer live-engine inputs without adding market or timeframe selectors."""
+    chart_data = chart_data or {}
+    context_text = str(user_context or "")
+    chart_text = " ".join(
+        str(value or "")
+        for value in (chart_data.get("asset", ""), chart_data.get("timeframe", ""))
+    )
+    pair_aliases = {
+        "BTC/USDT": ("btc/usdt", "btcusdt", "bitcoin", "btc"),
+        "EUR/USD": ("eur/usd", "eurusd", "euro"),
+        "GBP/USD": ("gbp/usd", "gbpusd", "pound"),
+        "USD/JPY": ("usd/jpy", "usdjpy", "yen"),
+        "AUD/USD": ("aud/usd", "audusd"),
+        "USD/CAD": ("usd/cad", "usdcad"),
+        "Gold (XAU/USD)": ("xau/usd", "xauusd", "gold"),
+    }
+    def detect_pair(text: str) -> str | None:
+        normalized = re.sub(r"[^a-z0-9/]+", " ", text.casefold())
+        for candidate, aliases in pair_aliases.items():
+            if any(alias in normalized for alias in aliases):
+                return candidate
+        return None
+
+    # Explicit trader notes outrank older chart-analysis metadata.
+    pair = detect_pair(context_text) or detect_pair(chart_text) or "BTC/USDT"
+
+    timeframe_patterns = (
+        ("1h", r"\b(?:1\s*hour|1\s*h|60\s*min(?:ute)?s?)\b"),
+        ("15m", r"\b(?:15\s*min(?:ute)?s?|15\s*m)\b"),
+        ("10m", r"\b(?:10\s*min(?:ute)?s?|10\s*m)\b"),
+        ("5m", r"\b(?:5\s*min(?:ute)?s?|5\s*m)\b"),
+        ("1m", r"\b(?:1\s*min(?:ute)?s?|1\s*m)\b"),
+    )
+    def detect_timeframe(text: str) -> str | None:
+        normalized = re.sub(r"[^a-z0-9/]+", " ", text.casefold())
+        for candidate, pattern in timeframe_patterns:
+            if re.search(pattern, normalized):
+                return candidate
+        return None
+
+    timeframe = (
+        detect_timeframe(context_text)
+        or detect_timeframe(chart_text)
+        or "5m"
+    )
+    return {"pair": pair, "timeframe": timeframe}
 
 
 def _live_interval_config(timeframe: str) -> dict:
@@ -2625,6 +2696,7 @@ def _fetch_mt5_market_data(
     timeframe_map = {
         "1m": getattr(mt5, "TIMEFRAME_M1", None),
         "5m": getattr(mt5, "TIMEFRAME_M5", None),
+        "10m": getattr(mt5, "TIMEFRAME_M10", None),
         "15m": getattr(mt5, "TIMEFRAME_M15", None),
         "1h": getattr(mt5, "TIMEFRAME_H1", None),
     }
@@ -2658,18 +2730,33 @@ def _fetch_public_market_data(pair: str, timeframe: str) -> tuple[pd.DataFrame, 
     market = _LIVE_MARKETS[pair]
     interval = _live_interval_config(timeframe)
     errors: list[str] = []
-    try:
-        frame = yf.download(
-            market["yahoo"],
-            period=interval["period"],
-            interval=interval["yahoo"],
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-        return _normalise_market_frame(frame), "Yahoo Finance public feed"
-    except Exception as exc:
-        errors.append("yfinance: " + _safe_error(exc))
+    if yf is not None:
+        try:
+            frame = yf.download(
+                market["yahoo"],
+                period=interval["period"],
+                interval=interval["yahoo"],
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            frame = _normalise_market_frame(frame)
+            if interval.get("resample_yahoo"):
+                minutes = interval["minutes"]
+                frame = frame.resample(f"{minutes}min").agg(
+                    {
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                        "volume": "sum",
+                    }
+                ).dropna(subset=["open", "high", "low", "close"])
+            return frame.tail(240), "Yahoo Finance public feed"
+        except Exception as exc:
+            errors.append("yfinance: " + _safe_error(exc))
+    else:
+        errors.append("yfinance is not installed")
 
     if ccxt is not None and market.get("ccxt"):
         try:
@@ -2787,6 +2874,7 @@ def _live_serialisable_data(market: dict) -> dict:
         "timeframe": market["timeframe"],
         "timeframe_minutes": market["timeframe_minutes"],
         "source": market["source"],
+        "trader_extra_context": market.get("user_context", ""),
         "latest": market["latest"],
         "indicator_metrics": market["indicator_metrics"],
         "recent_candles": candles,
@@ -2802,7 +2890,10 @@ def _build_live_prediction_prompt(market: dict) -> str:
         "are authoritative. Return a directional vote and a numerical forecast for "
         "the next 4 candles. Use realistic OHLC relationships: high must be at least "
         "max(open, close), and low must be at most min(open, close). "
-        "Do not invent a different pair or timeframe.\n\n"
+        "Do not invent a different pair or timeframe. Read every sentence in the "
+        "trader's extra context, including quoted information and direct questions. "
+        "If the trader asks where or when to trade, answer that question explicitly "
+        "in the analysis and vote.\n\n"
         "MARKET DATA:\n"
         + payload
         + "\n\nReturn ONLY valid JSON:\n"
@@ -2932,7 +3023,8 @@ def _build_live_deliberation_prompt(market: dict, votes: list[dict]) -> str:
         "multi-AI trading debate. The pair and timeframe are authoritative. Compare "
         "the evidence and numerical forecasts, correct unrealistic OHLC values, then "
         "return your final vote and 2 to 4 predicted candles. Keep the prediction "
-        "grounded in the latest OHLCV data and indicators.\n\n"
+        "grounded in the latest OHLCV data and indicators. Preserve and answer every "
+        "direct question in the trader's extra context.\n\n"
         "MARKET DATA:\n"
         + json.dumps(_live_serialisable_data(market), ensure_ascii=False)
         + "\n\nPEER POSITIONS:\n"
@@ -3232,6 +3324,7 @@ def _run_live_engine(request: dict, models: list[dict]) -> dict:
         request.get("mt5_password", ""),
         request.get("mt5_server", ""),
     )
+    market["user_context"] = str(request.get("user_context", "") or "")
     round_one = _run_live_prediction_round(market, models) if models else []
     revised = _run_live_deliberation_round(market, round_one) if round_one else []
     consensus = _build_live_consensus(market, revised)
@@ -3417,6 +3510,60 @@ with st.form("debate_inputs_form", clear_on_submit=False):
     )
 
 cached_debate = st.session_state.get("last_debate")
+live_cached = st.session_state.get("live_result")
+with st.expander("📈 Live Candlestick Chart & AI Forecast", expanded=False):
+    st.caption(
+        "The live engine keeps the market and candle interval automatic. It infers "
+        "them from Extra Context or a previously analyzed chart, then falls back to "
+        "BTC/USDT with 5-minute candles. No market or timeframe selector is used."
+    )
+    with st.form("live_chart_form", clear_on_submit=False):
+        mt5_columns = st.columns(3)
+        mt5_login = mt5_columns[0].text_input(
+            "MT5 account login (optional)",
+            key="live_mt5_login",
+        )
+        mt5_password = mt5_columns[1].text_input(
+            "MT5 password (optional)",
+            type="password",
+            key="live_mt5_password",
+        )
+        mt5_server = mt5_columns[2].text_input(
+            "MT5 server (optional)",
+            placeholder="Broker server name",
+            key="live_mt5_server",
+        )
+        live_run = st.form_submit_button(
+            "📈 Load Live Chart & Run AI Forecast",
+            use_container_width=True,
+            type="secondary",
+        )
+
+if live_run:
+    live_request = _infer_live_market_request(
+        extra_ctx,
+        cached_debate.get("chart_data", {}) if isinstance(cached_debate, dict) else {},
+    )
+    live_request.update(
+        {
+            "user_context": extra_ctx,
+            "mt5_login": mt5_login,
+            "mt5_password": mt5_password,
+            "mt5_server": mt5_server,
+        }
+    )
+    with st.spinner(
+        "📡 Loading live candles, indicators, and multi-AI forecast overlay…"
+    ):
+        try:
+            live_cached = _run_live_engine(live_request, _active_models())
+            st.session_state["live_result"] = live_cached
+        except Exception as exc:
+            st.error("Live chart loading failed: " + _safe_error(exc))
+
+if isinstance(live_cached, dict):
+    _render_live_engine(live_cached)
+
 if not run and not isinstance(cached_debate, dict):
     st.stop()
 
